@@ -521,3 +521,168 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+def draw_partition_on_y(frame_y: np.ndarray, leaf_blocks: List[Dict[str, Any]], line_value: int = 1023, thickness: int = 1) -> np.ndarray:
+    """
+    frame_y: (H, W), uint16
+    leaf_blocks: frame_result["leaf_blocks"]
+    line_value: 경계선 밝기 (10-bit: 0~1023)
+    thickness: 선 두께
+    """
+    out = frame_y.copy()
+    H, W = out.shape
+
+    for blk in leaf_blocks:
+        x = int(blk["x"])
+        y = int(blk["y"])
+        bs = int(blk["bs"])
+
+        x0, y0 = x, y
+        x1, y1 = x + bs - 1, y + bs - 1
+
+        # top
+        yy0 = max(0, y0)
+        yy1 = min(H, y0 + thickness)
+        xx0 = max(0, x0)
+        xx1 = min(W, x1 + 1)
+        out[yy0:yy1, xx0:xx1] = line_value
+
+        # bottom
+        yy0 = max(0, y1 - thickness + 1)
+        yy1 = min(H, y1 + 1)
+        xx0 = max(0, x0)
+        xx1 = min(W, x1 + 1)
+        out[yy0:yy1, xx0:xx1] = line_value
+
+        # left
+        yy0 = max(0, y0)
+        yy1 = min(H, y1 + 1)
+        xx0 = max(0, x0)
+        xx1 = min(W, x0 + thickness)
+        out[yy0:yy1, xx0:xx1] = line_value
+
+        # right
+        yy0 = max(0, y0)
+        yy1 = min(H, y1 + 1)
+        xx0 = max(0, x1 - thickness + 1)
+        xx1 = min(W, x1 + 1)
+        out[yy0:yy1, xx0:xx1] = line_value
+
+    return out
+
+
+def save_yuv420p10le_from_y_frames(y_frames: np.ndarray, out_path: Path):
+    """
+    y_frames: (T,H,W), uint16
+    U/V는 neutral chroma(512)로 채워 저장
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    T, H, W = y_frames.shape
+    uv_h, uv_w = H // 2, W // 2
+    u_plane = np.full((uv_h, uv_w), 512, dtype=np.uint16)
+    v_plane = np.full((uv_h, uv_w), 512, dtype=np.uint16)
+
+    with open(out_path, "wb") as f:
+        for t in range(T):
+            y = np.clip(y_frames[t], 0, 1023).astype(np.uint16)
+            y.astype("<u2").tofile(f)
+            u_plane.astype("<u2").tofile(f)
+            v_plane.astype("<u2").tofile(f)
+
+
+
+
+
+
+def process_clip(
+    clip_path: Path,
+    out_dir: Path,
+    width: int,
+    height: int,
+    num_frames: int,
+    target_noise: float,
+    root_bs: int,
+    min_bs: int,
+    split_penalty: float,
+    frame_start: int,
+    frame_end: int,
+    device: str,
+):
+    print(f"[INFO] Reading clip: {clip_path}")
+    clip_y = read_yuv420p10le_y_only(clip_path, width=width, height=height, num_frames=num_frames)
+
+    clip_name = clip_path.stem
+    clip_out_dir = out_dir / clip_name
+    clip_out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        "clip_name": clip_name,
+        "clip_path": str(clip_path),
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "target_noise": target_noise,
+        "root_bs": root_bs,
+        "min_bs": min_bs,
+        "split_penalty": split_penalty,
+        "frames": [],
+    }
+
+    # 전체 33프레임짜리 overlay clip 저장용
+    vis_y_frames = clip_y.copy()
+
+    for t in range(frame_start, frame_end + 1):
+        print(f"  [INFO] Frame {t}")
+        frame_result = optimize_frame_partition(
+            clip_y=clip_y,
+            frame_idx=t,
+            target_noise=target_noise,
+            root_bs=root_bs,
+            min_bs=min_bs,
+            split_penalty=split_penalty,
+            width=width,
+            height=height,
+            device=device,
+        )
+
+        summary["frames"].append({
+            "frame_idx": frame_result["frame_idx"],
+            "num_leaf_blocks": frame_result["num_leaf_blocks"],
+            "mean_abs_noise_diff": frame_result["mean_abs_noise_diff"],
+        })
+
+        save_json(frame_result, clip_out_dir / f"frame_{t:03d}.json")
+
+        # partition line을 원본 Y 위에 그림
+        vis_y_frames[t] = draw_partition_on_y(
+            frame_y=clip_y[t],
+            leaf_blocks=frame_result["leaf_blocks"],
+            line_value=1023,   # 흰색 선
+            thickness=1,
+        )
+
+    # 33프레임짜리 시각화 yuv 저장
+    save_yuv420p10le_from_y_frames(
+        vis_y_frames,
+        clip_out_dir / f"{clip_name}_partition_overlay.yuv"
+    )
+
+    save_json(summary, clip_out_dir / "summary.json")
+
+
+
+
+
+
