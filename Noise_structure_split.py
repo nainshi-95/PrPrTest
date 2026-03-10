@@ -384,6 +384,106 @@ plt.show()
 
 
 
+def tv_decompose(block, weight=12.0, n_iter=100):
+    """
+    block: 2D float64 grayscale block
+    weight: TV regularization strength
+            클수록 더 매끈한 structure, 더 큰 residual
+    n_iter: 반복 횟수
+
+    Returns:
+        structure, noise
+    """
+    f = block.astype(np.float64)
+    h, w = f.shape
+
+    px = np.zeros_like(f)
+    py = np.zeros_like(f)
+    tau = 0.125
+
+    for _ in range(n_iter):
+        # div p
+        div_p = np.zeros_like(f)
+        div_p[:-1, :] += py[:-1, :]
+        div_p[1:, :]  -= py[:-1, :]
+        div_p[:, :-1] += px[:, :-1]
+        div_p[:, 1:]  -= px[:, :-1]
+
+        u = f - weight * div_p
+
+        # gradient of u
+        ux = np.zeros_like(f)
+        uy = np.zeros_like(f)
+        ux[:, :-1] = np.diff(u, axis=1)
+        uy[:-1, :] = np.diff(u, axis=0)
+
+        # update dual
+        px_new = px + (tau / weight) * ux
+        py_new = py + (tau / weight) * uy
+
+        norm = np.maximum(1.0, np.sqrt(px_new**2 + py_new**2))
+        px = px_new / norm
+        py = py_new / norm
+
+    # final div
+    div_p = np.zeros_like(f)
+    div_p[:-1, :] += py[:-1, :]
+    div_p[1:, :]  -= py[:-1, :]
+    div_p[:, :-1] += px[:, :-1]
+    div_p[:, 1:]  -= px[:, :-1]
+
+    structure = f - weight * div_p
+    noise = f - structure
+    return structure, noise
+
+
+
+
+
+
+s_dct, n_dct = dct_decompose(block, cutoff=4)
+s_fil, n_fil = filter_decompose(block, sigma=1.5)
+# 방법 3: TV (gradient-based) decomposition
+s_tv, n_tv = tv_decompose(block, weight=12.0, n_iter=100)
+
+
+
+
+fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+methods = [
+    ('DCT (Frequency)', s_dct, n_dct),
+    ('Gaussian (Spatial)', s_fil, n_fil),
+    ('TV (Gradient-based)', s_tv, n_tv),
+]
+
+for i, (name, s, n) in enumerate(methods):
+    e_s = get_energy(s)
+    e_n = get_noise_energy(n)
+
+    axes[i, 0].imshow(block, cmap='gray', vmin=0, vmax=255)
+    axes[i, 0].set_title("Original Block")
+    axes[i, 0].axis('off')
+
+    axes[i, 1].imshow(s, cmap='gray', vmin=0, vmax=255)
+    axes[i, 1].set_title(f"{name} Structure\nEnergy: {e_s:.1e}")
+    axes[i, 1].axis('off')
+
+    axes[i, 2].imshow(n, cmap='gray', vmin=-20, vmax=20)
+    axes[i, 2].set_title(f"{name} Noise\nEnergy: {e_n:.1e}")
+    axes[i, 2].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print(f"[DCT]      구조 에너지: {get_energy(s_dct):.2f}, 노이즈 에너지: {get_noise_energy(n_dct):.2f}")
+print(f"[Gaussian] 구조 에너지: {get_energy(s_fil):.2f}, 노이즈 에너지: {get_noise_energy(n_fil):.2f}")
+print(f"[TV]       구조 에너지: {get_energy(s_tv):.2f}, 노이즈 에너지: {get_noise_energy(n_tv):.2f}")
+
+
+
+
+
+
 
 
 
