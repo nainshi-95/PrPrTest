@@ -275,4 +275,119 @@ print(f"[Adaptive Soft] structure: {get_energy(s_ads_s):.2f}, residual: {get_ene
 
 
 
+def gradient_features(block):
+
+    gx = sobel(block, axis=1)
+    gy = sobel(block, axis=0)
+
+    grad_energy = np.mean(gx**2 + gy**2)
+
+    jxx = np.mean(gx * gx)
+    jyy = np.mean(gy * gy)
+    jxy = np.mean(gx * gy)
+
+    J = np.array([[jxx, jxy], [jxy, jyy]])
+
+    eigvals = np.linalg.eigvalsh(J)
+
+    l1, l2 = eigvals[1], eigvals[0]
+
+    coherence = (l1 - l2) / (l1 + l2 + 1e-8)
+
+    return grad_energy, coherence
+
+
+
+
+
+def dct_lowfreq_ratio(block, cutoff=4):
+
+    c = dct2(block)
+
+    total = np.sum(c**2)
+
+    low = np.sum(c[:cutoff, :cutoff]**2)
+
+    return low / (total + 1e-8)
+
+
+
+
+
+
+def block_structure_score(block):
+
+    grad_energy, coherence = gradient_features(block)
+
+    dct_ratio = dct_lowfreq_ratio(block)
+
+    score = grad_energy * coherence * dct_ratio
+
+    return {
+        "score": score,
+        "grad_energy": grad_energy,
+        "coherence": coherence,
+        "dct_ratio": dct_ratio
+    }
+
+
+
+
+
+
+# block structure score 계산
+structure_info = block_structure_score(block)
+
+print("\n[Block Structure Score]")
+print(f"score       : {structure_info['score']:.4f}")
+print(f"grad_energy : {structure_info['grad_energy']:.4f}")
+print(f"coherence   : {structure_info['coherence']:.4f}")
+print(f"dct_ratio   : {structure_info['dct_ratio']:.4f}")
+
+
+
+
+
+
+
+
+
+
+gx = sobel(block, axis=1)
+gy = sobel(block, axis=0)
+
+grad_mag = np.sqrt(gx**2 + gy**2)
+
+fig, ax = plt.subplots(1,3, figsize=(9,3))
+
+ax[0].imshow(block, cmap='gray')
+ax[0].set_title("Block")
+
+ax[1].imshow(grad_mag, cmap='inferno')
+ax[1].set_title("Gradient magnitude")
+
+c = dct2(block)
+ax[2].imshow(np.log1p(np.abs(c)), cmap='magma')
+ax[2].set_title("DCT coeff")
+
+for a in ax:
+    a.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
