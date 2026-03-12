@@ -647,3 +647,130 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+@torch.no_grad()
+def measure_distortion_gradient_mse(x_1hw: torch.Tensor, y_1hw: torch.Tensor) -> float:
+    """
+    Gradient MSE using Sobel filters.
+    x_1hw, y_1hw: [1, H, W], float32 in [0,1]
+    Returns scalar float.
+    """
+    x = x_1hw.unsqueeze(0)  # [1,1,H,W]
+    y = y_1hw.unsqueeze(0)  # [1,1,H,W]
+
+    device = x.device
+    dtype = x.dtype
+
+    sobel_x = torch.tensor(
+        [[[-1, 0, 1],
+          [-2, 0, 2],
+          [-1, 0, 1]]],
+        device=device, dtype=dtype
+    ).unsqueeze(0)  # [1,1,3,3]
+
+    sobel_y = torch.tensor(
+        [[[-1, -2, -1],
+          [ 0,  0,  0],
+          [ 1,  2,  1]]],
+        device=device, dtype=dtype
+    ).unsqueeze(0)  # [1,1,3,3]
+
+    x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+    y_pad = F.pad(y, (1, 1, 1, 1), mode="reflect")
+
+    x_gx = F.conv2d(x_pad, sobel_x)
+    x_gy = F.conv2d(x_pad, sobel_y)
+    y_gx = F.conv2d(y_pad, sobel_x)
+    y_gy = F.conv2d(y_pad, sobel_y)
+
+    mse = ((x_gx - y_gx) ** 2 + (x_gy - y_gy) ** 2).mean()
+    return float(mse.item())
+
+
+
+
+
+@torch.no_grad()
+def measure_distortion_laplacian_mse(x_1hw: torch.Tensor, y_1hw: torch.Tensor) -> float:
+    """
+    Laplacian MSE.
+    x_1hw, y_1hw: [1, H, W], float32 in [0,1]
+    Returns scalar float.
+    """
+    x = x_1hw.unsqueeze(0)  # [1,1,H,W]
+    y = y_1hw.unsqueeze(0)  # [1,1,H,W]
+
+    device = x.device
+    dtype = x.dtype
+
+    lap = torch.tensor(
+        [[[0, -1,  0],
+          [-1, 4, -1],
+          [0, -1,  0]]],
+        device=device, dtype=dtype
+    ).unsqueeze(0)  # [1,1,3,3]
+
+    x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+    y_pad = F.pad(y, (1, 1, 1, 1), mode="reflect")
+
+    x_lap = F.conv2d(x_pad, lap)
+    y_lap = F.conv2d(y_pad, lap)
+
+    mse = ((x_lap - y_lap) ** 2).mean()
+    return float(mse.item())
+
+
+
+
+@torch.no_grad()
+def measure_distortion_edge_weighted_mse(
+    x_1hw: torch.Tensor,
+    y_1hw: torch.Tensor,
+    eps: float = 1e-12
+) -> float:
+    """
+    Edge-weighted pixel MSE.
+    Edge weights are computed from the original frame x using Sobel gradient magnitude.
+
+    x_1hw, y_1hw: [1, H, W], float32 in [0,1]
+    Returns scalar float.
+    """
+    x = x_1hw.unsqueeze(0)  # [1,1,H,W]
+    y = y_1hw.unsqueeze(0)  # [1,1,H,W]
+
+    device = x.device
+    dtype = x.dtype
+
+    sobel_x = torch.tensor(
+        [[[-1, 0, 1],
+          [-2, 0, 2],
+          [-1, 0, 1]]],
+        device=device, dtype=dtype
+    ).unsqueeze(0)  # [1,1,3,3]
+
+    sobel_y = torch.tensor(
+        [[[-1, -2, -1],
+          [ 0,  0,  0],
+          [ 1,  2,  1]]],
+        device=device, dtype=dtype
+    ).unsqueeze(0)  # [1,1,3,3]
+
+    x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+    x_gx = F.conv2d(x_pad, sobel_x)
+    x_gy = F.conv2d(x_pad, sobel_y)
+
+    weight = torch.sqrt(x_gx * x_gx + x_gy * x_gy + eps)  # [1,1,H,W]
+
+    err2 = (x - y) ** 2
+    weighted_mse = (weight * err2).sum() / (weight.sum() + eps)
+
+    return float(weighted_mse.item())
+
+
+
+
+
+
