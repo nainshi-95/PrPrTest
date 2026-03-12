@@ -1294,3 +1294,376 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+import os
+import csv
+import math
+import argparse
+from pathlib import Path
+from typing import List, Dict, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+# ------------------------------------------------------------
+# Gaussian blur
+# ------------------------------------------------------------
+def gaussian_kernel_2d_fixed_k(sigma: float, k: int = 5, device="cpu", dtype=torch.float32):
+    assert k % 2 == 1
+    if sigma <= 0:
+        ker = torch.zeros((1, 1, k, k), device=device, dtype=dtype)
+        ker[..., k // 2, k // 2] = 1.0
+        return ker
+    ax = torch.arange(-(k // 2), k // 2 + 1, device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    ker = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+    ker = ker / ker.sum()
+    return ker.view(1, 1, k, k)
+
+
+@torch.no_grad()
+def blur_tchw_fixed5(x_tchw: torch.Tensor, sigma: float) -> torch.Tensor:
+    """
+    x_tchw: [T, C, H, W] in [0,1]
+    Apply same 5x5 Gaussian per channel (grouped conv).
+    """
+    if sigma <= 0:
+        return x_tchw
+    _, C, _, _ = x_tchw.shape
+    ker = gaussian_kernel_2d_fixed_k(
+        sigma, k=5, device=x_tchw.device, dtype=x_tchw.dtype
+    )  # [1,1,5,5]
+    w = ker.repeat(C, 1, 1, 1)  # [C,1,5,5]
+    pad = 2
+    xb = F.pad(x_tchw, (pad, pad, pad, pad), mode="reflect")
+    yb = F.conv2d(xb, w, bias=None, stride=1, padding=0, groups=C)
+    return yb
+
+
+# ------------------------------------------------------------
+# YUV420p10le reader: Y only
+# ------------------------------------------------------------
+def read_yuv420p10le_luma(path: str, width: int, height: int, num_frames: int) -> np.ndarray:
+    """
+    Read only luma from a yuv420p10le file.
+
+    Returns:
+        Y: np.ndarray of shape [T, H, W], dtype=np.uint16
+    """
+    path = str(path)
+    y_size = width * height
+    uv_width = width // 2
+    uv_height = height // 2
+    uv_size = uv_width * uv_height
+
+    bytes_per_sample = 2
+    frame_bytes = (y_size + uv_size + uv_size) * bytes_per_sample
+
+    file_size = os.path.getsize(path)
+    expected_size = frame_bytes * num_frames
+    if file_size < expected_size:
+        raise ValueError(
+            f"File too small: {path}\n"
+            f"Expected at least {expected_size} bytes for {num_frames} frames, got {file_size}"
+        )
+
+    Y = np.empty((num_frames, height, width), dtype=np.uint16)
+
+    with open(path, "rb") as f:
+        for t in range(num_frames):
+            y = np.fromfile(f, dtype="<u2", count=y_size)
+            if y.size != y_size:
+                raise ValueError(f"Failed to read Y plane from {path}, frame {t}")
+            Y[t] = y.reshape(height, width)
+
+            _ = np.fromfile(f, dtype="<u2", count=uv_size)
+            _ = np.fromfile(f, dtype="<u2", count=uv_size)
+
+    return Y
+
+
+# ------------------------------------------------------------
+# Motion compensation stub
+# ------------------------------------------------------------
+@torch.no_grad()
+def motion_compensate_stub(target_1hw: torch.Tensor, reference_1hw: torch.Tensor) -> torch.Tensor:
+    """
+    target_1hw:    [1, H, W]  (clean domain)
+    reference_1hw: [1, H, W]  (clean domain)
+
+    IMPORTANT:
+      Motion estimation / compensation must be performed in the clean domain.
+
+    Replace this stub with your actual ME/MC.
+    Current placeholder returns identity reference.
+
+    Return:
+        compensated clean-domain predictor with shape [1, H, W]
+    """
+    return reference_1hw
+
+
+# ------------------------------------------------------------
+# Distortion metric
+# ------------------------------------------------------------
+@torch.no_grad()
+def measure_distortion(target_1hw: torch.Tensor, pred_1hw: torch.Tensor) -> float:
+    """
+    Distortion between target and predictor.
+    Current implementation: mean squared error.
+
+    target_1hw, pred_1hw: [1, H, W], float32 in [0,1]
+
+    You can later replace this with SATD or any custom metric.
+    """
+    diff = target_1hw - pred_1hw
+    return float((diff * diff).mean().item())
+
+
+# ------------------------------------------------------------
+# MC cache helpers
+# ------------------------------------------------------------
+def get_clip_cache_path(
+    mc_cache_dir: str,
+    clip_name: str,
+    width: int,
+    height: int,
+    num_frames: int,
+) -> Path:
+    """
+    Cache file path for one clip.
+    """
+    cache_dir = Path(mc_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"{clip_name}_w{width}_h{height}_f{num_frames}_mc_preds.pt"
+    return cache_dir / fname
+
+
+@torch.no_grad()
+def load_or_build_mc_preds(
+    clip_name: str,
+    Y_t1hw: torch.Tensor,
+    width: int,
+    height: int,
+    num_frames: int,
+    mc_cache_dir: Optional[str],
+    device: str,
+) -> List[torch.Tensor]:
+    """
+    Build or load clean-domain motion-compensated predictors.
+
+    Returns:
+        preds_clean: list of length (num_frames - 1)
+                     each element is [1, H, W] float32 on `device`
+    """
+    if mc_cache_dir is None:
+        preds_clean = []
+        for t in range(num_frames - 1):
+            target_clean = Y_t1hw[t]
+            reference_clean = Y_t1hw[t + 1]
+            pred_clean = motion_compensate_stub(target_clean, reference_clean)
+            preds_clean.append(pred_clean)
+        return preds_clean
+
+    cache_path = get_clip_cache_path(mc_cache_dir, clip_name, width, height, num_frames)
+
+    if cache_path.exists():
+        print(f"[CACHE] Loading MC predictors: {cache_path}")
+        payload = torch.load(cache_path, map_location="cpu")
+        preds_cpu = payload["preds_clean"]  # list of cpu tensors
+        preds_clean = [p.to(device) for p in preds_cpu]
+        return preds_clean
+
+    print(f"[CACHE] Building MC predictors: {cache_path}")
+    preds_clean = []
+    preds_cpu = []
+
+    for t in range(num_frames - 1):
+        target_clean = Y_t1hw[t]
+        reference_clean = Y_t1hw[t + 1]
+        pred_clean = motion_compensate_stub(target_clean, reference_clean)  # [1,H,W] on device
+        preds_clean.append(pred_clean)
+        preds_cpu.append(pred_clean.detach().cpu())
+
+    torch.save(
+        {
+            "clip_name": clip_name,
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "preds_clean": preds_cpu,
+        },
+        cache_path,
+    )
+
+    return preds_clean
+
+
+# ------------------------------------------------------------
+# Clip analysis
+# ------------------------------------------------------------
+@torch.no_grad()
+def analyze_clip(
+    y_path: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    sigma: float,
+    device: str = "cpu",
+    mc_cache_dir: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Analyze one clip with a clean-domain predictor:
+
+      1) Read clean frames
+      2) Blur frames
+      3) Build/load clean-domain MC predictors only once
+      4) For each pair (t, t+1):
+           - measure distortion of clean target vs clean predictor
+           - measure distortion of blurred target vs the SAME clean predictor
+      5) Average over all pairs
+    """
+    clip_name = Path(y_path).stem
+
+    Y_u16 = read_yuv420p10le_luma(y_path, width, height, num_frames)  # [T,H,W], uint16
+
+    Y = torch.from_numpy(Y_u16.astype(np.float32) / 1023.0).to(device)  # [T,H,W]
+    Y = Y.unsqueeze(1)  # [T,1,H,W]
+
+    Y_blur = blur_tchw_fixed5(Y, sigma=sigma)  # [T,1,H,W]
+
+    # ----------------------------------------------------
+    # Build/load clean-domain predictors once
+    # ----------------------------------------------------
+    preds_clean = load_or_build_mc_preds(
+        clip_name=clip_name,
+        Y_t1hw=Y,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        mc_cache_dir=mc_cache_dir,
+        device=device,
+    )
+
+    clean_distortions: List[float] = []
+    blur_distortions: List[float] = []
+
+    for t in range(num_frames - 1):
+        target_clean = Y[t]       # [1,H,W]
+        target_blur = Y_blur[t]   # [1,H,W]
+        pred_clean = preds_clean[t]
+
+        d_clean = measure_distortion(target_clean, pred_clean)
+        d_blur = measure_distortion(target_blur, pred_clean)
+
+        clean_distortions.append(d_clean)
+        blur_distortions.append(d_blur)
+
+    clean_mean = float(np.mean(clean_distortions)) if clean_distortions else 0.0
+    blur_mean = float(np.mean(blur_distortions)) if blur_distortions else 0.0
+
+    abs_increase = blur_mean - clean_mean
+    rel_increase = abs_increase / clean_mean if clean_mean > 0 else 0.0
+
+    return {
+        "clip_name": clip_name,
+        "sigma": float(sigma),
+        "num_pairs": int(num_frames - 1),
+        "clean_distortion_mean": clean_mean,
+        "blur_distortion_mean": blur_mean,
+        "abs_increase": abs_increase,
+        "rel_increase": rel_increase,
+    }
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+def find_yuv_files(yuv_dir: str) -> List[Path]:
+    exts = {".yuv"}
+    files = [p for p in sorted(Path(yuv_dir).iterdir()) if p.is_file() and p.suffix.lower() in exts]
+    return files
+
+
+def save_results_csv(rows: List[Dict[str, float]], output_csv: str):
+    if not rows:
+        print("[WARN] No rows to save.")
+        return
+
+    fieldnames = [
+        "clip_name",
+        "sigma",
+        "num_pairs",
+        "clean_distortion_mean",
+        "blur_distortion_mean",
+        "abs_increase",
+        "rel_increase",
+    ]
+
+    out_path = Path(output_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--yuv_dir", type=str, required=True, help="Directory containing yuv files")
+    parser.add_argument("--width", type=int, required=True)
+    parser.add_argument("--height", type=int, required=True)
+    parser.add_argument("--num_frames", type=int, required=True)
+    parser.add_argument("--sigma", type=float, required=True)
+    parser.add_argument("--output_csv", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument(
+        "--mc_cache_dir",
+        type=str,
+        default=None,
+        help="Directory to save/load clean-domain motion-compensated predictors",
+    )
+
+    args = parser.parse_args()
+
+    yuv_files = find_yuv_files(args.yuv_dir)
+    if not yuv_files:
+        raise FileNotFoundError(f"No .yuv files found in: {args.yuv_dir}")
+
+    results = []
+    for i, yuv_path in enumerate(yuv_files, 1):
+        print(f"[{i}/{len(yuv_files)}] Processing: {yuv_path.name}")
+        row = analyze_clip(
+            y_path=str(yuv_path),
+            width=args.width,
+            height=args.height,
+            num_frames=args.num_frames,
+            sigma=args.sigma,
+            device=args.device,
+            mc_cache_dir=args.mc_cache_dir,
+        )
+        results.append(row)
+
+    save_results_csv(results, args.output_csv)
+    print(f"[INFO] Saved CSV: {args.output_csv}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
