@@ -259,3 +259,144 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+
+
+def hadamard8x8(block):
+    H = np.array([
+        [1,1,1,1,1,1,1,1],
+        [1,-1,1,-1,1,-1,1,-1],
+        [1,1,-1,-1,1,1,-1,-1],
+        [1,-1,-1,1,1,-1,-1,1],
+        [1,1,1,1,-1,-1,-1,-1],
+        [1,-1,1,-1,-1,1,-1,1],
+        [1,1,-1,-1,-1,-1,1,1],
+        [1,-1,-1,1,-1,1,1,-1],
+    ], dtype=np.float32)
+
+    return H @ block @ H.T
+
+
+def satd8x8(block):
+    t = hadamard8x8(block)
+    return np.sum(np.abs(t)) / 64.0
+
+
+def frame_satd(residual, block=8):
+    h, w = residual.shape
+    s = 0.0
+
+    for y in range(0, h, block):
+        for x in range(0, w, block):
+            b = residual[y:y+block, x:x+block]
+            if b.shape == (block, block):
+                s += satd8x8(b)
+
+    return s
+
+
+def simple_motion_estimation(cur, ref, search=4):
+    h, w = cur.shape
+    best_dx = 0
+    best_dy = 0
+    best_cost = 1e18
+
+    for dy in range(-search, search+1):
+        for dx in range(-search, search+1):
+
+            shifted = np.roll(ref, (dy, dx), axis=(0,1))
+            cost = np.mean(np.abs(cur - shifted))
+
+            if cost < best_cost:
+                best_cost = cost
+                best_dx = dx
+                best_dy = dy
+
+    return best_dx, best_dy
+
+
+def motion_compensate(ref, dx, dy):
+    return np.roll(ref, (dy, dx), axis=(0,1))
+
+
+def find_ra_refs(idx, processed):
+    left = None
+    right = None
+
+    for p in processed:
+        if p < idx:
+            if left is None or p > left:
+                left = p
+        elif p > idx:
+            if right is None or p < right:
+                right = p
+
+    return left, right
+
+
+def ra_temporal_satd(frames, order):
+    """
+    frames: list of grayscale frames (numpy HxW)
+    order : RA coding order list
+    """
+
+    processed = []
+    energy = {}
+
+    for t in order:
+
+        if len(processed) < 2:
+            processed.append(t)
+            energy[t] = 0
+            continue
+
+        left, right = find_ra_refs(t, processed)
+
+        if left is None or right is None:
+            processed.append(t)
+            energy[t] = 0
+            continue
+
+        cur = frames[t]
+
+        refL = frames[left]
+        refR = frames[right]
+
+        dxL, dyL = simple_motion_estimation(cur, refL)
+        dxR, dyR = simple_motion_estimation(cur, refR)
+
+        mcL = motion_compensate(refL, dxL, dyL)
+        mcR = motion_compensate(refR, dxR, dyR)
+
+        pred = (mcL.astype(np.float32) + mcR.astype(np.float32)) * 0.5
+
+        residual = cur.astype(np.float32) - pred
+
+        satd = frame_satd(residual)
+
+        energy[t] = satd
+
+        processed.append(t)
+
+    return energy
