@@ -18,3 +18,46 @@ def satd_2d_fast(residual: torch.Tensor, normalize: bool = True) -> torch.Tensor
     if normalize:
         satd = satd / (h * w) ** 0.5
     return satd
+
+
+
+
+
+
+
+
+
+
+
+def frame_to_blocks(x: torch.Tensor, block: int) -> torch.Tensor:
+    """
+    x: (B, 1, H, W)
+    returns: (B, nH, nW, block, block)
+    """
+    B, C, H, W = x.shape
+    if C != 1:
+        raise ValueError("Only single-channel input supported here")
+    if H % block != 0 or W % block != 0:
+        raise ValueError("H and W must be divisible by block size")
+
+    patches = x.unfold(2, block, block).unfold(3, block, block)
+    # (B,1,nH,nW,block,block)
+    patches = patches.squeeze(1)
+    return patches
+
+
+def blockwise_satd(org: torch.Tensor, pred: torch.Tensor, block: int = 8) -> torch.Tensor:
+    """
+    org, pred: (B, 1, H, W)
+    returns: (B, nH, nW)
+    """
+    org_blk = frame_to_blocks(org, block)
+    pred_blk = frame_to_blocks(pred, block)
+    diff = org_blk - pred_blk
+    return satd_2d(diff, normalize=False)
+
+
+
+
+
+
