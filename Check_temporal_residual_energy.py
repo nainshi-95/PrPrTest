@@ -400,3 +400,250 @@ def ra_temporal_satd(frames, order):
         processed.append(t)
 
     return energy
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import csv
+import math
+import argparse
+from pathlib import Path
+from typing import List, Dict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+# ------------------------------------------------------------
+# Gaussian blur
+# ------------------------------------------------------------
+def gaussian_kernel_2d_fixed_k(sigma: float, k: int = 5, device="cpu", dtype=torch.float32):
+    assert k % 2 == 1
+    if sigma <= 0:
+        ker = torch.zeros((1, 1, k, k), device=device, dtype=dtype)
+        ker[..., k // 2, k // 2] = 1.0
+        return ker
+    ax = torch.arange(-(k // 2), k // 2 + 1, device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    ker = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+    ker = ker / ker.sum()
+    return ker.view(1, 1, k, k)
+
+
+@torch.no_grad()
+def blur_tchw_fixed5(x_tchw: torch.Tensor, sigma: float) -> torch.Tensor:
+    """
+    x_tchw: [T, C, H, W] in [0,1]
+    Apply same 5x5 Gaussian per channel (grouped conv).
+    """
+    if sigma <= 0:
+        return x_tchw
+    _, C, _, _ = x_tchw.shape
+    ker = gaussian_kernel_2d_fixed_k(
+        sigma, k=5, device=x_tchw.device, dtype=x_tchw.dtype
+    )  # [1,1,5,5]
+    w = ker.repeat(C, 1, 1, 1)  # [C,1,5,5]
+    pad = 2
+    xb = F.pad(x_tchw, (pad, pad, pad, pad), mode="reflect")
+    yb = F.conv2d(xb, w, bias=None, stride=1, padding=0, groups=C)
+    return yb
+
+
+# ------------------------------------------------------------
+# YUV420p10le reader: Y only
+# ------------------------------------------------------------
+def read_yuv420p10le_luma(path: str, width: int, height: int, num_frames: int) -> np.ndarray:
+    """
+    Read only luma from a yuv420p10le file.
+
+    Returns:
+        Y: np.ndarray of shape [T, H, W], dtype=np.uint16
+    """
+    path = str(path)
+    y_size = width * height
+    uv_width = width // 2
+    uv_height = height // 2
+    uv_size = uv_width * uv_height
+
+    # 10-bit stored in 16-bit little-endian samples
+    bytes_per_sample = 2
+    frame_bytes = (y_size + uv_size + uv_size) * bytes_per_sample
+
+    file_size = os.path.getsize(path)
+    expected_size = frame_bytes * num_frames
+    if file_size < expected_size:
+        raise ValueError(
+            f"File too small: {path}\n"
+            f"Expected at least {expected_size} bytes for {num_frames} frames, got {file_size}"
+        )
+
+    Y = np.empty((num_frames, height, width), dtype=np.uint16)
+
+    with open(path, "rb") as f:
+        for t in range(num_frames):
+            y = np.fromfile(f, dtype="<u2", count=y_size)
+            if y.size != y_size:
+                raise ValueError(f"Failed to read Y plane from {path}, frame {t}")
+            Y[t] = y.reshape(height, width)
+
+            # Skip U and V
+            _ = np.fromfile(f, dtype="<u2", count=uv_size)
+            _ = np.fromfile(f, dtype="<u2", count=uv_size)
+
+    return Y
+
+
+# ------------------------------------------------------------
+# Distortion measure
+# ------------------------------------------------------------
+@torch.no_grad()
+def measure_distortion(x_1hw: torch.Tensor, y_1hw: torch.Tensor, eps: float = 1e-12) -> float:
+    """
+    Distortion between two frames.
+    Currently implemented as PSNR in dB.
+
+    x_1hw, y_1hw: [1, H, W], float32 in [0,1]
+
+    You can later replace this body with SATD or any custom metric.
+    """
+    mse = torch.mean((x_1hw - y_1hw) ** 2).item()
+    if mse <= eps:
+        return 100.0
+    psnr = -10.0 * math.log10(mse)
+    return float(psnr)
+
+
+# ------------------------------------------------------------
+# Clip analysis
+# ------------------------------------------------------------
+@torch.no_grad()
+def analyze_clip(
+    y_path: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    sigma: float,
+    device: str = "cpu",
+) -> Dict[str, float]:
+    """
+    Analyze one clip:
+      - read original luma frames
+      - blur all frames
+      - measure frame-wise distortion between original and blurred frame
+      - average distortion over all frames
+    """
+    Y_u16 = read_yuv420p10le_luma(y_path, width, height, num_frames)  # [T,H,W], uint16
+
+    # Convert to [0,1] assuming 10-bit nominal range [0,1023]
+    Y = torch.from_numpy(Y_u16.astype(np.float32) / 1023.0).to(device)  # [T,H,W]
+    Y = Y.unsqueeze(1)  # [T,1,H,W]
+
+    Y_blur = blur_tchw_fixed5(Y, sigma=sigma)  # [T,1,H,W]
+
+    frame_scores: List[float] = []
+
+    for t in range(num_frames):
+        orig = Y[t]       # [1,H,W]
+        blur = Y_blur[t]  # [1,H,W]
+
+        score = measure_distortion(orig, blur)
+        frame_scores.append(score)
+
+    mean_score = float(np.mean(frame_scores)) if frame_scores else 0.0
+
+    return {
+        "clip_name": Path(y_path).stem,
+        "sigma": float(sigma),
+        "num_frames": int(num_frames),
+        "distortion_mean": mean_score,
+    }
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+def find_yuv_files(yuv_dir: str) -> List[Path]:
+    exts = {".yuv"}
+    files = [p for p in sorted(Path(yuv_dir).iterdir()) if p.is_file() and p.suffix.lower() in exts]
+    return files
+
+
+def save_results_csv(rows: List[Dict[str, float]], output_csv: str):
+    if not rows:
+        print("[WARN] No rows to save.")
+        return
+
+    fieldnames = [
+        "clip_name",
+        "sigma",
+        "num_frames",
+        "distortion_mean",
+    ]
+
+    out_path = Path(output_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--yuv_dir", type=str, required=True, help="Directory containing yuv files")
+    parser.add_argument("--width", type=int, required=True)
+    parser.add_argument("--height", type=int, required=True)
+    parser.add_argument("--num_frames", type=int, required=True)
+    parser.add_argument("--sigma", type=float, required=True)
+    parser.add_argument("--output_csv", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+
+    args = parser.parse_args()
+
+    yuv_files = find_yuv_files(args.yuv_dir)
+    if not yuv_files:
+        raise FileNotFoundError(f"No .yuv files found in: {args.yuv_dir}")
+
+    results = []
+    for i, yuv_path in enumerate(yuv_files, 1):
+        print(f"[{i}/{len(yuv_files)}] Processing: {yuv_path.name}")
+        row = analyze_clip(
+            y_path=str(yuv_path),
+            width=args.width,
+            height=args.height,
+            num_frames=args.num_frames,
+            sigma=args.sigma,
+            device=args.device,
+        )
+        results.append(row)
+
+    save_results_csv(results, args.output_csv)
+    print(f"[INFO] Saved CSV: {args.output_csv}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
