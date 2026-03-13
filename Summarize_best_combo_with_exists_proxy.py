@@ -253,24 +253,18 @@ def compute_si_ti(channel: np.ndarray) -> Tuple[float, float]:
 
 
 # ============================================================
-# Proxy sigma loading
+# Proxy sigma loading from long-format csv
 # ============================================================
-def load_proxy_best_sigma_map(
+def load_proxy_best_sigma_map_from_long_csv(
     proxy_sigma_csv: Path,
     qps: List[int],
-    sigma_col_prefix: str,
+    clip_col_candidates: List[str],
+    qp_col: str,
+    sigma_col: str,
 ) -> Dict[str, Dict[int, float]]:
     """
-    Expected columns:
-      clip_name or clip_id
-      <sigma_col_prefix>22
-      <sigma_col_prefix>27
-      ...
-
-    Example prefix:
-      pred_best_sigma_qp
-    then columns are:
-      pred_best_sigma_qp22, pred_best_sigma_qp27, ...
+    Expected long-format columns:
+      clip_name(or clip_id), qp, pred_best_sigma
 
     Returns:
       out[clip_id][qp] = sigma(float)
@@ -278,29 +272,39 @@ def load_proxy_best_sigma_map(
     df = pd.read_csv(proxy_sigma_csv)
     df.columns = [c.strip() for c in df.columns]
 
-    clip_key = None
-    for cand in ["clip_id", "clip_name"]:
+    clip_col = None
+    for cand in clip_col_candidates:
         if cand in df.columns:
-            clip_key = cand
+            clip_col = cand
             break
-    if clip_key is None:
-        raise KeyError("proxy sigma csv must contain clip_id or clip_name")
+    if clip_col is None:
+        raise KeyError(f"proxy sigma csv must contain one of {clip_col_candidates}")
 
+    if qp_col not in df.columns:
+        raise KeyError(f"proxy sigma csv missing column: {qp_col}")
+    if sigma_col not in df.columns:
+        raise KeyError(f"proxy sigma csv missing column: {sigma_col}")
+
+    qps_set = set(qps)
     out: Dict[str, Dict[int, float]] = {}
 
     for _, row in df.iterrows():
-        clip_id = str(row[clip_key]).strip()
+        clip_id = str(row[clip_col]).strip()
         if not clip_id:
             continue
 
+        qp_val = safe_float(row[qp_col])
+        sigma_val = safe_float(row[sigma_col])
+
+        if not np.isfinite(qp_val) or not np.isfinite(sigma_val):
+            continue
+
+        qp = int(round(qp_val))
+        if qp not in qps_set:
+            continue
+
         out.setdefault(clip_id, {})
-        for qp in qps:
-            col = f"{sigma_col_prefix}{qp}"
-            if col not in df.columns:
-                continue
-            v = safe_float(row[col])
-            if np.isfinite(v):
-                out[clip_id][qp] = float(v)
+        out[clip_id][qp] = float(sigma_val)
 
     return out
 
@@ -327,7 +331,6 @@ def build_curve_from_external_sigmas(
         out[f"psnr_{ch}_deblur"] = np.full(n, np.nan, dtype=np.float64)
 
     used_sigmas = []
-
     available_sigmas = sorted(per_sigma.keys())
 
     for qi, qp in enumerate(qp_list):
@@ -337,14 +340,12 @@ def build_curve_from_external_sigmas(
         if not np.isfinite(s):
             continue
 
-        # exact match preferred
         selected_sigma = None
         for ss in available_sigmas:
             if abs(float(ss) - float(s)) < 1e-12:
                 selected_sigma = ss
                 break
 
-        # fallback: nearest sigma if exact missing
         if selected_sigma is None and len(available_sigmas) > 0:
             selected_sigma = min(available_sigmas, key=lambda z: abs(float(z) - float(s)))
 
@@ -494,10 +495,16 @@ def main():
                     help='Comma-separated sigma list, e.g. "0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80"')
     ap.add_argument("--gt_yuv_root", type=str, required=True,
                     help="Folder containing all GT yuv clips named <clip_id>.yuv")
+
     ap.add_argument("--proxy_sigma_csv", type=str, required=True,
-                    help="CSV containing proxy-selected sigma per clip and qp")
-    ap.add_argument("--proxy_sigma_col_prefix", type=str, default="pred_best_sigma_qp",
-                    help='Prefix for proxy sigma columns, e.g. "pred_best_sigma_qp" -> pred_best_sigma_qp22')
+                    help="Long-format CSV such as fixed_lambda_selector_per_clip.csv")
+    ap.add_argument("--proxy_sigma_clip_cols", type=str, default="clip_name,clip_id",
+                    help='Comma-separated candidate clip id column names in proxy csv')
+    ap.add_argument("--proxy_sigma_qp_col", type=str, default="qp",
+                    help="QP column name in proxy sigma csv")
+    ap.add_argument("--proxy_sigma_value_col", type=str, default="pred_best_sigma",
+                    help="Predicted sigma column name in proxy sigma csv")
+
     ap.add_argument("--out", type=str, required=True)
 
     ap.add_argument("--qps", type=str, required=True,
@@ -527,12 +534,15 @@ def main():
     ensure_dir(scatter_root)
 
     # ------------------------------------------------------------
-    # Load proxy sigma selections
+    # Load proxy sigma selections from long-format CSV
     # ------------------------------------------------------------
-    proxy_sigma_map = load_proxy_best_sigma_map(
+    clip_col_candidates = [x.strip() for x in args.proxy_sigma_clip_cols.split(",") if x.strip()]
+    proxy_sigma_map = load_proxy_best_sigma_map_from_long_csv(
         proxy_sigma_csv=proxy_sigma_csv,
         qps=base_qp_list,
-        sigma_col_prefix=args.proxy_sigma_col_prefix,
+        clip_col_candidates=clip_col_candidates,
+        qp_col=args.proxy_sigma_qp_col,
+        sigma_col=args.proxy_sigma_value_col,
     )
 
     # ------------------------------------------------------------
@@ -592,10 +602,8 @@ def main():
             base_qp_list=base_qp_list,
         )
 
-        # indices of base_qps in full qp_list
         base_idx = np.array([qp_list.index(q) for q in base_qp_list if q in qp_list], dtype=int)
 
-        # BD-rate for Y/U/V : proxy-selected deblur vs matched enhance
         bdr = {}
         for ch in ["Y", "U", "V"]:
             bdr[ch] = bd_rate_cubic(
@@ -605,7 +613,6 @@ def main():
                 test_psnr=proxy_curve[f"psnr_{ch}_deblur"][base_idx],
             )
 
-        # reference enhance BD-rate vs gt_codec
         bdr_enh = {}
         for ch in ["Y", "U", "V"]:
             bdr_enh[ch] = bd_rate_cubic(
@@ -615,7 +622,6 @@ def main():
                 test_psnr=ref[f"psnr_{ch}_gt_enhance"],
             )
 
-        # Plot Y/U/V
         clip_plot_dir = plot_root / seq_class / seq_name / clip_id
         ensure_dir(clip_plot_dir)
 
@@ -636,7 +642,6 @@ def main():
                 y_label=f"PSNR-{ch} (dB)",
             )
 
-        # SI/TI
         yuv_path = gt_yuv_root / f"{clip_id}.yuv"
         si_y = si_u = si_v = np.nan
         ti_y = ti_u = ti_v = np.nan
@@ -692,9 +697,6 @@ def main():
     summary_csv = out_root / "per_clip_proxy_summary.csv"
     df.to_csv(summary_csv, index=False)
 
-    # ------------------------------------------------------------
-    # Scatter plots: SI/TI vs proxy BD-rate, per channel
-    # ------------------------------------------------------------
     for ch in ["Y", "U", "V"]:
         x_si = df[f"SI_{ch}"].to_numpy(dtype=np.float64)
         x_ti = df[f"TI_{ch}"].to_numpy(dtype=np.float64)
