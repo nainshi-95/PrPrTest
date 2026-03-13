@@ -1,9 +1,7 @@
-import os
 import re
-import math
 import argparse
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -60,12 +58,26 @@ def sanitize_filename(name: str) -> str:
 # ============================================================
 # Models
 # ============================================================
+def linear_model(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    return a * x + b
+
+
+def exp_model(x: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
+    """
+    y = a * exp(b*x) + c
+    overflow 방지를 위해 exponent clip
+    """
+    z = np.clip(b * x, -60.0, 60.0)
+    return a * np.exp(z) + c
+
+
 def logistic4(x: np.ndarray, a: float, b: float, c: float, d: float) -> np.ndarray:
     """
-    4-parameter logistic:
-        y = a + b / (1 + exp(-c * (x - d)))
+    y = a + b / (1 + exp(-c*(x-d)))
+    overflow 방지를 위해 exponent clip
     """
-    return a + b / (1.0 + np.exp(-c * (x - d)))
+    z = np.clip(-c * (x - d), -60.0, 60.0)
+    return a + b / (1.0 + np.exp(z))
 
 
 def poly2(x: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
@@ -75,16 +87,55 @@ def poly2(x: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
 # ============================================================
 # Fitting
 # ============================================================
-def fit_logistic4(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-        params: [a, b, c, d]
-        y_pred: fitted y on input x
-    """
+def fit_linear(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    coeffs = np.polyfit(x, y, deg=1)  # [a, b]
+    y_pred = np.polyval(coeffs, x)
+    return coeffs, y_pred
+
+
+def fit_poly2(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    coeffs = np.polyfit(x, y, deg=2)  # [a, b, c]
+    y_pred = np.polyval(coeffs, x)
+    return coeffs, y_pred
+
+
+def fit_exp(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
-    # Robust-ish initial guess
+    y_min = float(np.min(y))
+    y_max = float(np.max(y))
+    x_span = float(np.max(x) - np.min(x))
+    if x_span < 1e-12:
+        x_span = 1.0
+
+    # 초기값
+    p0 = np.array([
+        max(y_max - y_min, 1e-6),   # a
+        1.0 / x_span,               # b
+        y_min,                      # c
+    ], dtype=np.float64)
+
+    lower = np.array([-np.inf, -100.0, -np.inf], dtype=np.float64)
+    upper = np.array([ np.inf,  100.0,  np.inf], dtype=np.float64)
+
+    params, _ = curve_fit(
+        exp_model,
+        x,
+        y,
+        p0=p0,
+        bounds=(lower, upper),
+        maxfev=200000,
+    )
+
+    y_pred = exp_model(x, *params)
+    return params, y_pred
+
+
+def fit_logistic4(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
     y_min = float(np.min(y))
     y_max = float(np.max(y))
     x_mean = float(np.mean(x))
@@ -99,9 +150,8 @@ def fit_logistic4(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]
         x_mean,                 # d
     ], dtype=np.float64)
 
-    # Bounds are intentionally broad
-    lower = np.array([-np.inf, -np.inf, -np.inf, -np.inf], dtype=np.float64)
-    upper = np.array([ np.inf,  np.inf,  np.inf,  np.inf], dtype=np.float64)
+    lower = np.array([-np.inf, -np.inf, -100.0, -np.inf], dtype=np.float64)
+    upper = np.array([ np.inf,  np.inf,  100.0,  np.inf], dtype=np.float64)
 
     params, _ = curve_fit(
         logistic4,
@@ -116,23 +166,15 @@ def fit_logistic4(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]
     return params, y_pred
 
 
-def fit_poly2(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-        params: [a, b, c]
-        y_pred: fitted y on input x
-    """
-    coeffs = np.polyfit(x, y, deg=2)
-    # numpy returns [a, b, c]
-    y_pred = np.polyval(coeffs, x)
-    return coeffs, y_pred
-
-
 def try_fit_model(model_name: str, x: np.ndarray, y: np.ndarray):
-    if model_name == "logistic":
-        params, y_pred = fit_logistic4(x, y)
+    if model_name == "linear":
+        params, y_pred = fit_linear(x, y)
     elif model_name == "poly2":
         params, y_pred = fit_poly2(x, y)
+    elif model_name == "exp":
+        params, y_pred = fit_exp(x, y)
+    elif model_name == "logistic":
+        params, y_pred = fit_logistic4(x, y)
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
@@ -144,14 +186,18 @@ def try_fit_model(model_name: str, x: np.ndarray, y: np.ndarray):
 # Equation formatting
 # ============================================================
 def format_equation(model_name: str, params: np.ndarray) -> str:
-    if model_name == "logistic":
-        a, b, c, d = params
-        return (
-            f"y = {a:.6g} + {b:.6g} / (1 + exp(-{c:.6g} * (x - {d:.6g})))"
-        )
+    if model_name == "linear":
+        a, b = params
+        return f"y = {a:.6g} x + {b:.6g}"
     elif model_name == "poly2":
         a, b, c = params
         return f"y = {a:.6g} x^2 + {b:.6g} x + {c:.6g}"
+    elif model_name == "exp":
+        a, b, c = params
+        return f"y = {a:.6g} exp({b:.6g} x) + {c:.6g}"
+    elif model_name == "logistic":
+        a, b, c, d = params
+        return f"y = {a:.6g} + {b:.6g}/(1 + exp(-{c:.6g}(x - {d:.6g})))"
     else:
         return "Unknown model"
 
@@ -159,6 +205,19 @@ def format_equation(model_name: str, params: np.ndarray) -> str:
 # ============================================================
 # Plotting
 # ============================================================
+def eval_model(model_name: str, x: np.ndarray, params: np.ndarray) -> np.ndarray:
+    if model_name == "linear":
+        return linear_model(x, *params)
+    elif model_name == "poly2":
+        return poly2(x, *params)
+    elif model_name == "exp":
+        return exp_model(x, *params)
+    elif model_name == "logistic":
+        return logistic4(x, *params)
+    else:
+        raise ValueError(model_name)
+
+
 def plot_fit(
     x: np.ndarray,
     y: np.ndarray,
@@ -181,13 +240,7 @@ def plot_fit(
         pad = 0.05 * (x_max - x_min)
         x_plot = np.linspace(x_min - pad, x_max + pad, 400)
 
-    if model_name == "logistic":
-        y_plot = logistic4(x_plot, *params)
-    elif model_name == "poly2":
-        y_plot = poly2(x_plot, *params)
-    else:
-        raise ValueError(model_name)
-
+    y_plot = eval_model(model_name, x_plot, params)
     plt.plot(x_plot, y_plot)
 
     eq = format_equation(model_name, params)
@@ -271,6 +324,8 @@ def fit_one_pair_best_model(
     for model_name in candidate_models:
         try:
             params, _y_pred, r2 = try_fit_model(model_name, x, y)
+            if np.isnan(r2):
+                continue
             if (best is None) or (r2 > best["r2"]):
                 best = {
                     "model_name": model_name,
@@ -297,32 +352,20 @@ def fit_one_pair_best_model(
 def save_regression_summary_csv(results: List[Dict], output_csv: Path):
     ensure_dir(output_csv.parent)
 
-    fieldnames = [
-        "sigma_tag",
-        "qp",
-        "x_key",
-        "y_key",
-        "num_points",
-        "best_model",
-        "best_r2",
-        "equation",
-    ]
+    rows = []
+    for r in results:
+        rows.append({
+            "sigma_tag": r["sigma_tag"],
+            "qp": r["qp"],
+            "x_key": r["x_key"],
+            "y_key": r["y_key"],
+            "num_points": r["num_points"],
+            "best_model": r["best_model"],
+            "best_r2": r["best_r2"],
+            "equation": r["equation"],
+        })
 
-    with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = pd.DataFrame([
-            {
-                "sigma_tag": r["sigma_tag"],
-                "qp": r["qp"],
-                "x_key": r["x_key"],
-                "y_key": r["y_key"],
-                "num_points": r["num_points"],
-                "best_model": r["best_model"],
-                "best_r2": r["best_r2"],
-                "equation": r["equation"],
-            }
-            for r in results
-        ])
-        writer.to_csv(f, index=False)
+    pd.DataFrame(rows).to_csv(output_csv, index=False)
 
 
 # ============================================================
@@ -364,8 +407,8 @@ def main():
     parser.add_argument(
         "--models",
         type=str,
-        default="logistic,poly2",
-        help='Candidate models, comma-separated. Example: "logistic,poly2"',
+        default="linear,exp,logistic,poly2",
+        help='Candidate models, comma-separated. Example: "linear,exp,logistic,poly2"',
     )
     parser.add_argument(
         "--output_dir",
@@ -399,7 +442,7 @@ def main():
 
     for sigma_tag in sigma_tags:
         for qp in qps:
-            for target_name, y_key_base, y_label in target_specs:
+            for _target_name, y_key_base, y_label in target_specs:
                 try:
                     result = fit_one_pair_best_model(
                         df=df,
