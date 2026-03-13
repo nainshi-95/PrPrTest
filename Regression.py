@@ -354,6 +354,16 @@ def save_regression_summary_csv(results: List[Dict], output_csv: Path):
 
     rows = []
     for r in results:
+        params = r["params"]
+        if params is None:
+            p0 = p1 = p2 = p3 = np.nan
+            param_count = 0
+        else:
+            params = list(np.asarray(params, dtype=np.float64).reshape(-1))
+            param_count = len(params)
+            padded = params + [np.nan] * (4 - len(params))
+            p0, p1, p2, p3 = padded[:4]
+
         rows.append({
             "sigma_tag": r["sigma_tag"],
             "qp": r["qp"],
@@ -362,7 +372,12 @@ def save_regression_summary_csv(results: List[Dict], output_csv: Path):
             "num_points": r["num_points"],
             "best_model": r["best_model"],
             "best_r2": r["best_r2"],
-            "equation": r["equation"],
+            "param_count": param_count,
+            "param_0": p0,
+            "param_1": p1,
+            "param_2": p2,
+            "param_3": p3,
+            "equation": r["equation"],  # 보기 편하라고 남겨둠. 원치 않으면 삭제 가능
         })
 
     pd.DataFrame(rows).to_csv(output_csv, index=False)
