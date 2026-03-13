@@ -354,3 +354,151 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+
+
+
+
+def safe_float(x: str):
+    if x is None:
+        return None
+    x = str(x).strip()
+    if x == "":
+        return None
+    try:
+        return float(x)
+    except ValueError:
+        return None
+
+
+def psnr_to_mse(psnr: float) -> float:
+    return 10 ** (-psnr / 10.0)
+
+
+
+
+
+
+
+
+
+
+
+
+def build_output_fieldnames(
+    sigma_list: List[float],
+    x_metrics: List[str],
+    qps: List[int],
+    y_metrics: List[str],
+) -> List[str]:
+    fieldnames = ["clip_name"]
+
+    has_kbps_gt = "kbps_gt" in y_metrics
+    has_kbps_blur = "kbps_blur" in y_metrics
+    has_psnr_gt_enh = "psnrY_gt_enh" in y_metrics
+    has_psnr_blur_deblur = "psnrY_blur_deblur" in y_metrics
+
+    for sigma in sigma_list:
+        sigma_tag = sigma_to_tag(sigma)
+
+        # X-axis columns first
+        for xm in x_metrics:
+            fieldnames.append(f"{xm}_{sigma_tag}")
+
+        # Then Y-axis columns for each qp
+        for qp in qps:
+            for ym in y_metrics:
+                col = f"{ym}_{sigma_tag}_qp{qp}"
+                fieldnames.append(col)
+
+                # kbps_blur 바로 뒤에 delta_kbps 추가
+                if ym == "kbps_blur" and has_kbps_gt:
+                    fieldnames.append(f"delta_kbps_{sigma_tag}_qp{qp}")
+
+                # psnrY_blur_deblur 바로 뒤에 delta_mse 추가
+                if ym == "psnrY_blur_deblur" and has_psnr_gt_enh:
+                    fieldnames.append(f"delta_mse_{sigma_tag}_qp{qp}")
+
+    return fieldnames
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def build_output_rows(
+    clip_names: List[str],
+    sigma_list: List[float],
+    x_metrics: List[str],
+    qps: List[int],
+    y_metrics: List[str],
+    x_data: Dict[Tuple[str, str], Dict[str, str]],
+    y_data: Dict[Tuple[str, str, int], Dict[str, str]],
+) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+
+    has_kbps_gt = "kbps_gt" in y_metrics
+    has_kbps_blur = "kbps_blur" in y_metrics
+    has_psnr_gt_enh = "psnrY_gt_enh" in y_metrics
+    has_psnr_blur_deblur = "psnrY_blur_deblur" in y_metrics
+
+    for clip_name in clip_names:
+        out_row: Dict[str, str] = {"clip_name": clip_name}
+
+        for sigma in sigma_list:
+            sigma_tag = sigma_to_tag(sigma)
+
+            # X-axis first
+            x_rec = x_data.get((clip_name, sigma_tag), {})
+            for xm in x_metrics:
+                out_row[f"{xm}_{sigma_tag}"] = x_rec.get(xm, "")
+
+            # Y-axis next, for each qp
+            for qp in qps:
+                y_rec = y_data.get((clip_name, sigma_tag, qp), {})
+
+                # 먼저 원래 y metric들 기록
+                for ym in y_metrics:
+                    col = f"{ym}_{sigma_tag}_qp{qp}"
+                    out_row[col] = y_rec.get(ym, "")
+
+                    # kbps_blur 바로 뒤에 delta_kbps
+                    if ym == "kbps_blur" and has_kbps_gt:
+                        kbps_gt = safe_float(y_rec.get("kbps_gt", ""))
+                        kbps_blur = safe_float(y_rec.get("kbps_blur", ""))
+
+                        delta_col = f"delta_kbps_{sigma_tag}_qp{qp}"
+                        if kbps_gt is None or kbps_blur is None:
+                            out_row[delta_col] = ""
+                        else:
+                            out_row[delta_col] = kbps_blur - kbps_gt
+
+                    # psnrY_blur_deblur 바로 뒤에 delta_mse
+                    if ym == "psnrY_blur_deblur" and has_psnr_gt_enh:
+                        psnr_gt = safe_float(y_rec.get("psnrY_gt_enh", ""))
+                        psnr_blur = safe_float(y_rec.get("psnrY_blur_deblur", ""))
+
+                        delta_col = f"delta_mse_{sigma_tag}_qp{qp}"
+                        if psnr_gt is None or psnr_blur is None:
+                            out_row[delta_col] = ""
+                        else:
+                            mse_gt = psnr_to_mse(psnr_gt)
+                            mse_blur = psnr_to_mse(psnr_blur)
+                            out_row[delta_col] = mse_blur - mse_gt
+
+        rows.append(out_row)
+
+    return rows
