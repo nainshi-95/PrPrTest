@@ -248,140 +248,244 @@ def satd_16x16_btchw(res_btchw: torch.Tensor) -> torch.Tensor:
     if H < blk or W < blk:
         raise ValueError(f"H and W must be >= 16, got H={H}, W={W}")
 
-    # crop to multiple of 16
     Hc = (H // blk) * blk
     Wc = (W // blk) * blk
     x = res_btchw[:, :, :, :Hc, :Wc]  # [B,T,1,Hc,Wc]
 
-    # [B*T, 1, Hc, Wc]
-    x = x.reshape(B * T, 1, Hc, Wc)
+    x = x.reshape(B * T, 1, Hc, Wc)  # [BT,1,Hc,Wc]
 
-    # unfold into 16x16 non-overlapping blocks
-    # -> [BT, 16*16, Nblk]
+    # [BT, 16*16, Nblk]
     patches = F.unfold(x, kernel_size=blk, stride=blk)
 
-    # -> [BT, Nblk, 16, 16]
+    # [BT, Nblk, 16, 16]
     patches = patches.transpose(1, 2).reshape(-1, blk, blk)
 
     H16 = hadamard_matrix(blk, device=patches.device, dtype=patches.dtype)  # [16,16]
 
-    # 2D Hadamard transform: H * X * H^T
-    # Since H is symmetric, H^T = H
     coeff = H16 @ patches @ H16
-
-    # SATD = sum(abs(coeff)) / scale
-    # scale factor is convention-dependent; constant factor does not matter for loss.
-    satd = coeff.abs().sum(dim=(1, 2)) / blk  # [BT * Nblk]
+    satd = coeff.abs().sum(dim=(1, 2)) / blk
 
     return satd.mean()
 
 
-def temporal_consistency_satd_loss(
-    blur_bt1hw: torch.Tensor,
+def resize_flow(flow_b2hw: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    """
+    Resize flow to new spatial size and scale displacement accordingly.
+
+    Args:
+        flow_b2hw: [B,2,H,W]
+    Returns:
+        resized flow: [B,2,out_h,out_w]
+    """
+    if flow_b2hw.ndim != 4 or flow_b2hw.shape[1] != 2:
+        raise ValueError(f"Expected flow [B,2,H,W], got {tuple(flow_b2hw.shape)}")
+
+    B, _, H, W = flow_b2hw.shape
+    if H == out_h and W == out_w:
+        return flow_b2hw
+
+    flow_resized = F.interpolate(
+        flow_b2hw,
+        size=(out_h, out_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    scale_x = float(out_w) / float(W)
+    scale_y = float(out_h) / float(H)
+
+    flow_resized[:, 0:1] *= scale_x
+    flow_resized[:, 1:2] *= scale_y
+    return flow_resized
+
+
+def temporal_consistency_satd_loss_yuv420(
+    y_bt1hw: torch.Tensor,
+    u_bt1hw: torch.Tensor,
+    v_bt1hw: torch.Tensor,
     spynet,
     warp_fn,
     detach_flow: bool = False,
+    y_weight: float = 1.0,
+    u_weight: float = 1.0,
+    v_weight: float = 1.0,
     return_details: bool = False,
 ):
     """
-    Temporal consistency loss using forward/backward motion compensation + 16x16 SATD.
+    Temporal consistency loss for YUV420 inputs.
 
-    Args:
-        blur_bt1hw: [B, T, 1, H, W]
-        spynet:
-            A flow network callable like:
-                flow = spynet(img1, img2)
-            where img1,img2 are [B,1,H,W] or [B,C,H,W]
-            and flow is [B,2,H,W].
+    Flow is computed ONCE using YUV444 made by bilinear upsampling U/V.
 
-            Assumption:
-              - spynet(a, b) returns flow that warps 'a' toward 'b'
-                OR at least is consistent with warp_fn below.
-        warp_fn:
-            A warping function callable like:
-                warped = warp_fn(src, flow)
-            where src is [B,1,H,W], flow is [B,2,H,W],
-            and output is [B,1,H,W].
+    Inputs:
+        y_bt1hw: [B,T,1,H,W]
+        u_bt1hw: [B,T,1,H/2,W/2]
+        v_bt1hw: [B,T,1,H/2,W/2]
 
-            IMPORTANT:
-              This code assumes:
-                warp_fn(frame_{t+1}, flow_{t+1->t}) predicts frame_t
-                warp_fn(frame_{t},   flow_{t->t+1}) predicts frame_{t+1}
+    Flow strategy:
+        1) Upsample U,V to Y resolution
+        2) Concatenate Y,U_up,V_up -> YUV444 [B,T,3,H,W]
+        3) Compute forward/backward flow once on YUV444
+        4) Use original flow for Y
+        5) Resize flow to UV resolution for U/V and scale displacement accordingly
 
-        detach_flow:
-            If True, flow is detached before warping.
-            Useful when you do not want gradients into SPyNet.
-        return_details:
-            If True, returns a dict with intermediate losses.
+    Warp convention assumption:
+        - spynet(a, b) returns flow mapping a -> b
+        - warp_fn(src, flow_ab) warps src into b-domain
 
     Returns:
-        loss (scalar tensor)
-        or
-        (loss, details)
+        scalar loss
+        or (loss, details)
     """
-    if blur_bt1hw.ndim != 5:
-        raise ValueError(f"Expected blur_bt1hw [B,T,1,H,W], got {tuple(blur_bt1hw.shape)}")
+    # -----------------------------
+    # shape checks
+    # -----------------------------
+    if y_bt1hw.ndim != 5 or u_bt1hw.ndim != 5 or v_bt1hw.ndim != 5:
+        raise ValueError("All inputs must be 5D tensors")
 
-    B, T, C, H, W = blur_bt1hw.shape
-    if C != 1:
-        raise ValueError(f"Expected C=1, got C={C}")
+    By, Ty, Cy, Hy, Wy = y_bt1hw.shape
+    Bu, Tu, Cu, Hu, Wu = u_bt1hw.shape
+    Bv, Tv, Cv, Hv, Wv = v_bt1hw.shape
+
+    if Cy != 1 or Cu != 1 or Cv != 1:
+        raise ValueError("Expected single-channel Y/U/V tensors")
+
+    if not (By == Bu == Bv and Ty == Tu == Tv):
+        raise ValueError("Y/U/V must have same batch/time dimensions")
+
+    if Hu * 2 != Hy or Wu * 2 != Wy or Hv * 2 != Hy or Wv * 2 != Wy:
+        raise ValueError(
+            f"Expected YUV420 shapes, got Y={tuple(y_bt1hw.shape)}, "
+            f"U={tuple(u_bt1hw.shape)}, V={tuple(v_bt1hw.shape)}"
+        )
+
+    B, T = By, Ty
     if T < 2:
         raise ValueError(f"T must be >= 2, got T={T}")
 
-    # Collect residual tensors from:
-    # 1) next -> current  (backward flow)
-    # 2) prev -> current  (forward flow)
-    residuals = []
+    # -----------------------------
+    # build YUV444 for flow
+    # -----------------------------
+    u_up = F.interpolate(
+        u_bt1hw.reshape(B * T, 1, Hu, Wu),
+        size=(Hy, Wy),
+        mode="bilinear",
+        align_corners=False,
+    ).view(B, T, 1, Hy, Wy)
 
-    loss_next_to_curr = []
-    loss_prev_to_curr = []
+    v_up = F.interpolate(
+        v_bt1hw.reshape(B * T, 1, Hv, Wv),
+        size=(Hy, Wy),
+        mode="bilinear",
+        align_corners=False,
+    ).view(B, T, 1, Hy, Wy)
+
+    yuv444_bt3hw = torch.cat([y_bt1hw, u_up, v_up], dim=2)  # [B,T,3,H,W]
+
+    # -----------------------------
+    # collect residuals
+    # -----------------------------
+    y_residuals = []
+    u_residuals = []
+    v_residuals = []
+
+    y_next_to_curr = []
+    y_prev_to_next = []
+    u_next_to_curr = []
+    u_prev_to_next = []
+    v_next_to_curr = []
+    v_prev_to_next = []
 
     for t in range(T - 1):
-        cur = blur_bt1hw[:, t]       # [B,1,H,W]
-        nxt = blur_bt1hw[:, t + 1]   # [B,1,H,W]
+        cur_444 = yuv444_bt3hw[:, t]      # [B,3,Hy,Wy]
+        nxt_444 = yuv444_bt3hw[:, t + 1]  # [B,3,Hy,Wy]
 
-        # flow from current to next
-        flow_t_to_t1 = spynet(cur, nxt)      # [B,2,H,W]
-        # flow from next to current
-        flow_t1_to_t = spynet(nxt, cur)      # [B,2,H,W]
+        # flows on YUV444
+        flow_t_to_t1 = spynet(cur_444, nxt_444)     # [B,2,Hy,Wy]
+        flow_t1_to_t = spynet(nxt_444, cur_444)     # [B,2,Hy,Wy]
 
         if detach_flow:
             flow_t_to_t1 = flow_t_to_t1.detach()
             flow_t1_to_t = flow_t1_to_t.detach()
 
-        # Predict current frame from next frame
-        pred_cur_from_next = warp_fn(nxt, flow_t1_to_t)   # should align nxt -> cur
-        res_cur_from_next = cur - pred_cur_from_next      # [B,1,H,W]
-        residuals.append(res_cur_from_next.unsqueeze(1))  # [B,1,1,H,W]
+        # -------------------------
+        # Y residuals (full-res flow)
+        # -------------------------
+        y_cur = y_bt1hw[:, t]       # [B,1,Hy,Wy]
+        y_nxt = y_bt1hw[:, t + 1]   # [B,1,Hy,Wy]
 
-        # Predict next frame from current frame
-        pred_next_from_cur = warp_fn(cur, flow_t_to_t1)   # should align cur -> nxt
-        res_next_from_cur = nxt - pred_next_from_cur      # [B,1,H,W]
-        residuals.append(res_next_from_cur.unsqueeze(1))  # [B,1,1,H,W]
+        y_pred_cur_from_next = warp_fn(y_nxt, flow_t1_to_t)
+        y_res_cur_from_next = y_cur - y_pred_cur_from_next
 
-        # optional per-direction bookkeeping
-        loss_next_to_curr.append(res_cur_from_next.unsqueeze(1))
-        loss_prev_to_curr.append(res_next_from_cur.unsqueeze(1))
+        y_pred_next_from_cur = warp_fn(y_cur, flow_t_to_t1)
+        y_res_next_from_cur = y_nxt - y_pred_next_from_cur
 
-    # residual list elements are [B,1,1,H,W]
-    # concatenate along T-like dimension
-    residuals_bt1hw = torch.cat(residuals, dim=1)  # [B, 2*(T-1), 1, H, W]
+        y_residuals.append(y_res_cur_from_next.unsqueeze(1))
+        y_residuals.append(y_res_next_from_cur.unsqueeze(1))
 
-    total_loss = satd_16x16_btchw(residuals_bt1hw)
+        y_next_to_curr.append(y_res_cur_from_next.unsqueeze(1))
+        y_prev_to_next.append(y_res_next_from_cur.unsqueeze(1))
+
+        # -------------------------
+        # UV residuals (half-res flow)
+        # -------------------------
+        flow_t_to_t1_uv = resize_flow(flow_t_to_t1, Hu, Wu)
+        flow_t1_to_t_uv = resize_flow(flow_t1_to_t, Hu, Wu)
+
+        u_cur = u_bt1hw[:, t]       # [B,1,Hu,Wu]
+        u_nxt = u_bt1hw[:, t + 1]
+        v_cur = v_bt1hw[:, t]
+        v_nxt = v_bt1hw[:, t + 1]
+
+        u_pred_cur_from_next = warp_fn(u_nxt, flow_t1_to_t_uv)
+        u_res_cur_from_next = u_cur - u_pred_cur_from_next
+
+        u_pred_next_from_cur = warp_fn(u_cur, flow_t_to_t1_uv)
+        u_res_next_from_cur = u_nxt - u_pred_next_from_cur
+
+        v_pred_cur_from_next = warp_fn(v_nxt, flow_t1_to_t_uv)
+        v_res_cur_from_next = v_cur - v_pred_cur_from_next
+
+        v_pred_next_from_cur = warp_fn(v_cur, flow_t_to_t1_uv)
+        v_res_next_from_cur = v_nxt - v_pred_next_from_cur
+
+        u_residuals.append(u_res_cur_from_next.unsqueeze(1))
+        u_residuals.append(u_res_next_from_cur.unsqueeze(1))
+        v_residuals.append(v_res_cur_from_next.unsqueeze(1))
+        v_residuals.append(v_res_next_from_cur.unsqueeze(1))
+
+        u_next_to_curr.append(u_res_cur_from_next.unsqueeze(1))
+        u_prev_to_next.append(u_res_next_from_cur.unsqueeze(1))
+        v_next_to_curr.append(v_res_cur_from_next.unsqueeze(1))
+        v_prev_to_next.append(v_res_next_from_cur.unsqueeze(1))
+
+    # [B,2*(T-1),1,H,W] for Y
+    y_residuals_bt1hw = torch.cat(y_residuals, dim=1)
+    u_residuals_bt1hw = torch.cat(u_residuals, dim=1)
+    v_residuals_bt1hw = torch.cat(v_residuals, dim=1)
+
+    y_loss = satd_16x16_btchw(y_residuals_bt1hw)
+    u_loss = satd_16x16_btchw(u_residuals_bt1hw)
+    v_loss = satd_16x16_btchw(v_residuals_bt1hw)
+
+    total_weight = y_weight + u_weight + v_weight
+    total_loss = (y_weight * y_loss + u_weight * u_loss + v_weight * v_loss) / total_weight
 
     if not return_details:
         return total_loss
 
-    next_to_curr_bt1hw = torch.cat(loss_next_to_curr, dim=1)  # [B,T-1,1,H,W]
-    prev_to_curr_bt1hw = torch.cat(loss_prev_to_curr, dim=1)  # [B,T-1,1,H,W]
-
     details = {
         "loss_total": total_loss,
-        "loss_next_to_curr": satd_16x16_btchw(next_to_curr_bt1hw),
-        "loss_prev_to_curr": satd_16x16_btchw(prev_to_curr_bt1hw),
+        "loss_y": y_loss,
+        "loss_u": u_loss,
+        "loss_v": v_loss,
         "num_pairs": T - 1,
-        "num_residual_frames": 2 * (T - 1),
+        "num_residual_frames_per_channel": 2 * (T - 1),
+
+        "loss_y_next_to_curr": satd_16x16_btchw(torch.cat(y_next_to_curr, dim=1)),
+        "loss_y_prev_to_next": satd_16x16_btchw(torch.cat(y_prev_to_next, dim=1)),
+        "loss_u_next_to_curr": satd_16x16_btchw(torch.cat(u_next_to_curr, dim=1)),
+        "loss_u_prev_to_next": satd_16x16_btchw(torch.cat(u_prev_to_next, dim=1)),
+        "loss_v_next_to_curr": satd_16x16_btchw(torch.cat(v_next_to_curr, dim=1)),
+        "loss_v_prev_to_next": satd_16x16_btchw(torch.cat(v_prev_to_next, dim=1)),
     }
     return total_loss, details
-
-
