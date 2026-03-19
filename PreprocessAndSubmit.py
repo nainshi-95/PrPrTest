@@ -78,15 +78,16 @@ def save_yuv420p10le(
 def build_model():
     """
     Replace this with your actual blur network creation/loading.
+
     Expected:
         y_out, u_out, v_out = model(y, u, v)
 
-    Input:
+    Inputs:
         y: [B,T,1,H,W]
         u: [B,T,1,H/2,W/2]
         v: [B,T,1,H/2,W/2]
 
-    Output:
+    Outputs:
         same shapes
     """
     raise NotImplementedError("Replace build_model() with your actual model loader.")
@@ -120,10 +121,10 @@ def run_model_on_triplet(
 
     y_out, u_out, v_out = model(y, u, v)
 
-    # expected [1,3,1,H,W] etc
-    y_out = y_out.squeeze(0).squeeze(1).detach().cpu().numpy()  # [3,H,W]
-    u_out = u_out.squeeze(0).squeeze(1).detach().cpu().numpy()  # [3,H/2,W/2]
-    v_out = v_out.squeeze(0).squeeze(1).detach().cpu().numpy()  # [3,H/2,W/2]
+    # expected [1,3,1,H,W], [1,3,1,H/2,W/2], [1,3,1,H/2,W/2]
+    y_out = y_out.squeeze(0).squeeze(1).detach().cpu().numpy()
+    u_out = u_out.squeeze(0).squeeze(1).detach().cpu().numpy()
+    v_out = v_out.squeeze(0).squeeze(1).detach().cpu().numpy()
 
     return y_out, u_out, v_out
 
@@ -174,7 +175,7 @@ def process_one_npz(
 
 
 # ============================================================
-# Encoder command helpers
+# Encoder helpers
 # ============================================================
 def build_encoder_cmd(
     encoder_app: Path,
@@ -191,10 +192,7 @@ def build_encoder_cmd(
     frame_rate: int,
 ) -> str:
     """
-    Adjust this function if your EncoderApp CLI differs.
-
-    Current example is VTM/EncoderApp-like.
-    stdout/stderr are redirected to log file.
+    Adjust this if your EncoderApp CLI differs.
     """
     cmd = (
         f"{shlex.quote(str(encoder_app))} "
@@ -220,10 +218,6 @@ def submit_bsub_batch(
     extra_bsub_args: str = "",
     dry_run: bool = False,
 ):
-    """
-    Submit:
-      bsub -J JOB "(cmd1)& (cmd2)& ... & wait"
-    """
     if not cmds:
         return
 
@@ -245,8 +239,24 @@ def submit_bsub_batch(
     subprocess.run(parts, check=True)
 
 
-def chunk_list(xs: List, chunk_size: int) -> List[List]:
-    return [xs[i:i + chunk_size] for i in range(0, len(xs), chunk_size)]
+def build_paths_for_encoder_outputs(
+    yuv_path: Path,
+    blur_out_root: Path,
+    bit_out_root: Path,
+    recon_out_root: Path,
+    log_out_root: Path,
+) -> Tuple[Path, Path, Path]:
+    rel = yuv_path.relative_to(blur_out_root).with_suffix("")
+
+    bit_path = (bit_out_root / rel).with_suffix(".bin")
+    recon_path = (recon_out_root / rel).with_suffix(".yuv")
+    log_path = (log_out_root / rel).with_suffix(".log")
+
+    bit_path.parent.mkdir(parents=True, exist_ok=True)
+    recon_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    return bit_path, recon_path, log_path
 
 
 # ============================================================
@@ -269,7 +279,7 @@ def main():
     parser.add_argument("--recon_out_root", type=str, default="", help="Recon output root")
     parser.add_argument("--log_out_root", type=str, default="", help="Encoder log output root")
 
-    parser.add_argument("--batch_size", type=int, default=8, help="How many sequences per one bsub submission")
+    parser.add_argument("--batch_size", type=int, default=8, help="How many sequences per bsub submission")
     parser.add_argument("--job_prefix", type=str, default="HEVC_8CPU", help="bsub job name prefix")
     parser.add_argument("--queue", type=str, default="", help="Optional bsub queue")
     parser.add_argument("--extra_bsub_args", type=str, default="", help='Extra args for bsub, e.g. \'-n 8 -R "span[hosts=1]"\'')
@@ -297,11 +307,33 @@ def main():
     model = model.to(device)
     model.eval()
 
-    generated_yuvs: List[Path] = []
+    encoder_app = None
+    cfg_path = None
+    bit_out_root = None
+    recon_out_root = None
+    log_out_root = None
 
-    # ------------------------------------------------------------
-    # Step 1: npz -> blurred yuv
-    # ------------------------------------------------------------
+    if args.submit_bsub:
+        if not args.cfg_path or not args.bin_dir or not args.bit_out_root or not args.recon_out_root or not args.log_out_root:
+            raise ValueError(
+                "When --submit_bsub is used, you must provide "
+                "--cfg_path, --bin_dir, --bit_out_root, --recon_out_root, --log_out_root"
+            )
+
+        cfg_path = Path(args.cfg_path)
+        encoder_app = Path(args.bin_dir) / args.encoder_name
+        bit_out_root = Path(args.bit_out_root)
+        recon_out_root = Path(args.recon_out_root)
+        log_out_root = Path(args.log_out_root)
+
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"cfg_path not found: {cfg_path}")
+        if not encoder_app.exists():
+            raise FileNotFoundError(f"EncoderApp not found: {encoder_app}")
+
+    pending_cmds: List[str] = []
+    submitted_job_count = 0
+
     for i, npz_path in enumerate(npz_files, 1):
         rel = npz_path.relative_to(npz_root)
         out_yuv_path = (blur_out_root / rel).with_suffix(".yuv")
@@ -313,77 +345,63 @@ def main():
             out_yuv_path=out_yuv_path,
             device=device,
         )
-        generated_yuvs.append(out_yuv_path)
 
-    print(f"[INFO] Blurred YUVs saved under: {blur_out_root}")
+        if args.submit_bsub:
+            bit_path, recon_path, log_path = build_paths_for_encoder_outputs(
+                yuv_path=out_yuv_path,
+                blur_out_root=blur_out_root,
+                bit_out_root=bit_out_root,
+                recon_out_root=recon_out_root,
+                log_out_root=log_out_root,
+            )
 
-    # ------------------------------------------------------------
-    # Step 2: bsub submit EncoderApp
-    # ------------------------------------------------------------
-    if not args.submit_bsub:
-        return
+            cmd = build_encoder_cmd(
+                encoder_app=encoder_app,
+                cfg_path=cfg_path,
+                input_yuv=out_yuv_path,
+                bitstream_path=bit_path,
+                recon_path=recon_path,
+                log_path=log_path,
+                width=args.width,
+                height=args.height,
+                frames=args.frames,
+                qp=args.qp,
+                intra_period=args.intra_period,
+                frame_rate=args.frame_rate,
+            )
+            pending_cmds.append(cmd)
 
-    if not args.cfg_path or not args.bin_dir or not args.bit_out_root or not args.recon_out_root or not args.log_out_root:
-        raise ValueError(
-            "When --submit_bsub is used, you must provide "
-            "--cfg_path, --bin_dir, --bit_out_root, --recon_out_root, --log_out_root"
-        )
+            # Stream submit as soon as batch is full
+            if len(pending_cmds) >= args.batch_size:
+                job_name = f"{args.job_prefix}_{submitted_job_count:04d}"
+                submit_bsub_batch(
+                    cmds=pending_cmds,
+                    job_name=job_name,
+                    queue=args.queue,
+                    extra_bsub_args=args.extra_bsub_args,
+                    dry_run=args.dry_run_bsub,
+                )
+                submitted_job_count += 1
+                pending_cmds = []
 
-    cfg_path = Path(args.cfg_path)
-    encoder_app = Path(args.bin_dir) / args.encoder_name
-    bit_out_root = Path(args.bit_out_root)
-    recon_out_root = Path(args.recon_out_root)
-    log_out_root = Path(args.log_out_root)
-
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"cfg_path not found: {cfg_path}")
-    if not encoder_app.exists():
-        raise FileNotFoundError(f"EncoderApp not found: {encoder_app}")
-
-    cmd_list = []
-    for yuv_path in generated_yuvs:
-        rel = yuv_path.relative_to(blur_out_root).with_suffix("")
-
-        bit_path = (bit_out_root / rel).with_suffix(".bin")
-        recon_path = (recon_out_root / rel).with_suffix(".yuv")
-        log_path = (log_out_root / rel).with_suffix(".log")
-
-        bit_path.parent.mkdir(parents=True, exist_ok=True)
-        recon_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        cmd = build_encoder_cmd(
-            encoder_app=encoder_app,
-            cfg_path=cfg_path,
-            input_yuv=yuv_path,
-            bitstream_path=bit_path,
-            recon_path=recon_path,
-            log_path=log_path,
-            width=args.width,
-            height=args.height,
-            frames=args.frames,
-            qp=args.qp,
-            intra_period=args.intra_period,
-            frame_rate=args.frame_rate,
-        )
-        cmd_list.append(cmd)
-
-    batches = chunk_list(cmd_list, args.batch_size)
-
-    for bi, batch_cmds in enumerate(batches):
-        job_name = f"{args.job_prefix}_{bi:04d}"
+    # Submit remaining commands
+    if args.submit_bsub and pending_cmds:
+        job_name = f"{args.job_prefix}_{submitted_job_count:04d}"
         submit_bsub_batch(
-            cmds=batch_cmds,
+            cmds=pending_cmds,
             job_name=job_name,
             queue=args.queue,
             extra_bsub_args=args.extra_bsub_args,
             dry_run=args.dry_run_bsub,
         )
+        submitted_job_count += 1
 
-    print(f"[INFO] Submitted {len(batches)} bsub jobs")
-    print(f"[INFO] Bitstreams under: {bit_out_root}")
-    print(f"[INFO] Recons under: {recon_out_root}")
-    print(f"[INFO] Logs under: {log_out_root}")
+    print(f"[INFO] Blurred YUVs saved under: {blur_out_root}")
+    if args.submit_bsub:
+        print(f"[INFO] Submitted {submitted_job_count} bsub jobs")
+        print(f"[INFO] Bitstreams under: {bit_out_root}")
+        print(f"[INFO] Recons under: {recon_out_root}")
+        print(f"[INFO] Logs under: {log_out_root}")
 
 
 if __name__ == "__main__":
