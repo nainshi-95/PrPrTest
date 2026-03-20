@@ -406,3 +406,101 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@torch.no_grad()
+def process_one_npz(
+    model: torch.nn.Module,
+    npz_path: Path,
+    out_yuv_path: Path,
+    device: torch.device,
+):
+    """
+    Requirement:
+      original Vimeo sequence has 7 frames
+      use triplets:
+        [0,1,2], [3,4,5], [6,5,4]
+      run all 3 triplets together as a batch
+
+      output total 7 frames:
+        first triplet -> keep 3 frames
+        second triplet -> keep 3 frames
+        third triplet -> keep only first frame
+    """
+    Y, U, V = load_npz_yuv(npz_path)
+
+    Y = to_float01(Y)
+    U = to_float01(U)
+    V = to_float01(V)
+
+    T = Y.shape[0]
+    if T < 7:
+        raise ValueError(f"{npz_path} has only {T} frames, but need at least 7")
+
+    # Build 3 triplets:
+    #  [0,1,2], [3,4,5], [6,5,4]
+    Y_batch = np.stack([Y[0:3], Y[3:6], Y[[6, 5, 4]]], axis=0)  # [3,3,H,W]
+    U_batch = np.stack([U[0:3], U[3:6], U[[6, 5, 4]]], axis=0)  # [3,3,H/2,W/2]
+    V_batch = np.stack([V[0:3], V[3:6], V[[6, 5, 4]]], axis=0)  # [3,3,H/2,W/2]
+
+    Y_out_batch, U_out_batch, V_out_batch = run_model_on_triplet_batch(
+        model=model,
+        Y_batch=Y_batch,
+        U_batch=U_batch,
+        V_batch=V_batch,
+        device=device,
+    )
+
+    # Keep:
+    #   triplet 0 -> all 3 frames
+    #   triplet 1 -> all 3 frames
+    #   triplet 2 -> only first frame (corresponding to original frame 6)
+    Y_out = np.concatenate(
+        [Y_out_batch[0], Y_out_batch[1], Y_out_batch[2, 0:1]],
+        axis=0,
+    )  # [7,H,W]
+
+    U_out = np.concatenate(
+        [U_out_batch[0], U_out_batch[1], U_out_batch[2, 0:1]],
+        axis=0,
+    )  # [7,H/2,W/2]
+
+    V_out = np.concatenate(
+        [V_out_batch[0], V_out_batch[1], V_out_batch[2, 0:1]],
+        axis=0,
+    )  # [7,H/2,W/2]
+
+    Y_u10 = float01_to_uint10(Y_out)
+    U_u10 = float01_to_uint10(U_out)
+    V_u10 = float01_to_uint10(V_out)
+
+    save_yuv420p10le(out_yuv_path, Y_u10, U_u10, V_u10)
+
+
