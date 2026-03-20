@@ -1,102 +1,176 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import argparse
-import json
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    import yaml
+except ImportError as e:
+    raise ImportError("PyYAML not installed. Install: pip install pyyaml") from e
+
 
 # ============================================================
-# JSON loading
+# YAML + seq cfg parsing
 # ============================================================
-def load_json_meta(json_path: Path) -> List[Dict[str, Any]]:
+_CFG_LINE_RE = __import__("re").compile(r"^\s*([^:#]+?)\s*:\s*(.*?)\s*$")
+
+
+def load_yaml_dict(yaml_path: Path) -> Dict:
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        d = yaml.safe_load(f)
+    if not isinstance(d, dict):
+        raise ValueError("YAML root must be dict.")
+    return d
+
+
+def parse_seq_cfg(seq_cfg_path: Path) -> Dict[str, str]:
+    if not seq_cfg_path.is_file():
+        raise FileNotFoundError(seq_cfg_path)
+
+    lines = seq_cfg_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines:
+        return {}
+
+    out: Dict[str, str] = {}
+    for raw in lines[1:]:
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("#") or s.startswith("//"):
+            continue
+        if "#" in s:
+            s = s.split("#", 1)[0].rstrip()
+
+        m = _CFG_LINE_RE.match(s)
+        if not m:
+            continue
+        k = m.group(1).strip()
+        v = m.group(2).strip()
+        if k:
+            out[k] = v
+    return out
+
+
+def collect_seq_items_from_yaml(
+    yaml_path: Path,
+    only_seq: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
     """
-    Supported JSON formats:
-
-    1) list of dicts
-    [
-      {
-        "name": "SeqA",
-        "yuv_path": "/path/to/SeqA.yuv",
-        "width": 3840,
-        "height": 2160,
-        "frames": 33,
-        "frame_rate": 60,
-        "bit_depth": 10,
-        "seq_cls": "ClassA"
-      }
-    ]
-
-    2) {"sequences": [...]}
-
-    3) {"seq": {"SeqA": {...}, "SeqB": {...}}}
+    Expected YAML root:
+      seq:
+        SeqName:
+          path: /path/to/fullres.yuv      (or yuv_path / yuv)
+          seq_cls: ClassA
+          seq_cfg: /path/to/seq.cfg       (optional)
+          width: 3840                     (optional if seq_cfg exists)
+          height: 2160                    (optional if seq_cfg exists)
+          frames: 97                      (optional if seq_cfg exists)
+          bit_depth: 8 or 10              (optional if seq_cfg exists)
+          fps: 60                         (optional if seq_cfg exists)
     """
-    obj = json.loads(json_path.read_text(encoding="utf-8"))
+    y = load_yaml_dict(yaml_path)
+    if "seq" not in y or not isinstance(y["seq"], dict):
+        raise KeyError("YAML missing seq dict")
 
-    if isinstance(obj, list):
-        raw_items = obj
-    elif isinstance(obj, dict) and "sequences" in obj:
-        raw_items = obj["sequences"]
-    elif isinstance(obj, dict) and "seq" in obj and isinstance(obj["seq"], dict):
-        raw_items = []
-        for seq_name, info in obj["seq"].items():
-            if not isinstance(info, dict):
-                continue
-            d = dict(info)
-            d.setdefault("name", seq_name)
-            raw_items.append(d)
-    else:
-        raise ValueError("Unsupported JSON format")
+    seq_dict: Dict[str, Dict] = y["seq"]
+    items: List[Dict[str, Any]] = []
 
-    def pick(d: Dict[str, Any], keys: List[str], default=None):
+    def _pick(d: Dict[str, Any], keys: List[str], default=None):
         for k in keys:
             if k in d:
                 return d[k]
         return default
 
-    out = []
-    for d in raw_items:
-        if not isinstance(d, dict):
+    for seq_name, info in seq_dict.items():
+        if not isinstance(info, dict):
+            continue
+        if only_seq is not None and seq_name not in only_seq:
             continue
 
-        name = pick(d, ["name", "seq_name", "sequence_name", "id"])
-        yuv_path = pick(d, ["yuv_path", "path", "yuv", "file_path"])
-        width = pick(d, ["width", "w", "Width"])
-        height = pick(d, ["height", "h", "Height"])
-        frames = pick(d, ["frames", "num_frames", "FrameToBeEncoded"])
-        frame_rate = pick(d, ["frame_rate", "fps", "FrameRate"], 30.0)
-        bit_depth = pick(d, ["bit_depth", "bitdepth", "BitDepth"], 10)
-        seq_cls = pick(d, ["seq_cls", "class", "sequence_class"], "NA")
+        seq_cls = str(info.get("seq_cls", "NA"))
+        seq_cfg = info.get("seq_cfg", None)
 
-        if name is None or yuv_path is None or width is None or height is None or frames is None:
-            raise ValueError(f"Missing required fields in JSON item: {d}")
+        width = _pick(info, ["width", "w", "source_width"], None)
+        height = _pick(info, ["height", "h", "source_height"], None)
+        frames = _pick(info, ["frames", "num_frames", "FrameToBeEncoded"], None)
+        bit_depth = _pick(info, ["bit_depth", "bitdepth", "input_bit_depth"], None)
+        fps = _pick(info, ["fps", "frame_rate", "FrameRate"], None)
+        yuv_path = _pick(info, ["path", "yuv_path", "yuv"], None)
 
-        out.append({
-            "name": str(name),
+        if seq_cfg:
+            cfg_path = Path(str(seq_cfg))
+            if cfg_path.is_file():
+                cfg = parse_seq_cfg(cfg_path)
+                if width is None:
+                    try:
+                        width = int(cfg.get("SourceWidth", cfg.get("InputFileWidth", "")))
+                    except Exception:
+                        pass
+                if height is None:
+                    try:
+                        height = int(cfg.get("SourceHeight", cfg.get("InputFileHeight", "")))
+                    except Exception:
+                        pass
+                if frames is None:
+                    try:
+                        frames = int(cfg.get("FramesToBeEncoded", cfg.get("FrameToBeEncoded", "")))
+                    except Exception:
+                        pass
+                if fps is None:
+                    try:
+                        fps = float(cfg.get("FrameRate", "30"))
+                    except Exception:
+                        pass
+                if bit_depth is None:
+                    try:
+                        bit_depth = int(cfg.get("InputBitDepth", cfg.get("BitDepth", "10")))
+                    except Exception:
+                        pass
+                if yuv_path is None:
+                    yuv_in_cfg = cfg.get("InputFile", "").strip()
+                    if yuv_in_cfg:
+                        yuv_path = yuv_in_cfg
+
+        if yuv_path is None:
+            raise ValueError(f"Missing yuv path for seq={seq_name}")
+        if width is None or height is None:
+            raise ValueError(f"Missing width/height for seq={seq_name}")
+        if frames is None:
+            raise ValueError(f"Missing frames for seq={seq_name}")
+        if fps is None:
+            fps = 30.0
+        if bit_depth is None:
+            bit_depth = 10
+
+        items.append({
+            "name": str(seq_name),
+            "seq_cls": str(seq_cls),
             "yuv_path": str(yuv_path),
             "width": int(width),
             "height": int(height),
             "frames": int(frames),
-            "frame_rate": float(frame_rate),
+            "frame_rate": float(fps),
             "bit_depth": int(bit_depth),
-            "seq_cls": str(seq_cls),
         })
 
-    if not out:
-        raise ValueError("No valid sequences found in JSON")
+    if not items:
+        raise RuntimeError("No valid sequences found in YAML after filters.")
 
-    return out
+    return items
 
 
 # ============================================================
-# YUV420p raw IO
+# YUV420 raw IO
 # ============================================================
 def read_yuv420p_raw(
     path: Path,
@@ -112,7 +186,7 @@ def read_yuv420p_raw(
       V: [T,H/2,W/2]
 
     dtype:
-      uint8  if bit_depth <= 8
+      uint8 if bit_depth <= 8
       uint16 if bit_depth > 8
     """
     if bit_depth <= 8:
@@ -153,8 +227,8 @@ def save_yuv420p10le(
     V: np.ndarray,
 ):
     """
-    Save as planar yuv420p10le.
-    Y: [T,H,W] uint16 in [0,1023]
+    Save planar yuv420p10le.
+    Y: [T,H,W] uint16
     U: [T,H/2,W/2] uint16
     V: [T,H/2,W/2] uint16
     """
@@ -206,17 +280,9 @@ def build_model():
 
 
 # ============================================================
-# Temporal reflect padding helpers
+# Temporal reflect indexing
 # ============================================================
 def reflect_index_1d(i: int, n: int) -> int:
-    """
-    reflect style:
-      n=5
-      -1 -> 1
-      -2 -> 2
-       5 -> 3
-       6 -> 2
-    """
     if n <= 1:
         return 0
     while i < 0 or i >= n:
@@ -230,7 +296,7 @@ def reflect_index_1d(i: int, n: int) -> int:
 def get_triplet_indices_no_overlap(start: int, T: int) -> List[int]:
     """
     Non-overlap 3-frame chunk starting at start.
-    Missing frames are reflect-padded.
+    Missing frames are reflect padded.
     """
     return [
         reflect_index_1d(start + 0, T),
@@ -240,14 +306,11 @@ def get_triplet_indices_no_overlap(start: int, T: int) -> List[int]:
 
 
 # ============================================================
-# Spatial padding to multiple of 16
+# Spatial pad to multiple of 16
 # ============================================================
 def pad_btchw_to_multiple_of_16(x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     x: [B,T,C,H,W]
-    returns:
-      padded_x
-      (pad_h, pad_w)
     """
     B, T, C, H, W = x.shape
     pad_h = (16 - (H % 16)) % 16
@@ -272,17 +335,22 @@ def crop_btchw(x: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
 
 
 # ============================================================
-# Network inference
+# Inference
 # ============================================================
 @torch.no_grad()
 def run_model_on_triplet(
     model: torch.nn.Module,
-    Y3: np.ndarray,   # [3,H,W], float [0,1]
-    U3: np.ndarray,   # [3,H/2,W/2]
-    V3: np.ndarray,   # [3,H/2,W/2]
+    Y3: np.ndarray,
+    U3: np.ndarray,
+    V3: np.ndarray,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
+    Inputs:
+      Y3: [3,H,W]
+      U3: [3,H/2,W/2]
+      V3: [3,H/2,W/2]
+
     Returns:
       Y_out: [3,H,W]
       U_out: [3,H/2,W/2]
@@ -302,9 +370,9 @@ def run_model_on_triplet(
     u_out = crop_btchw(u_out, puy, pux)
     v_out = crop_btchw(v_out, pvy, pvx)
 
-    y_out = y_out.squeeze(0).squeeze(1).detach().cpu().numpy()  # [3,H,W]
-    u_out = u_out.squeeze(0).squeeze(1).detach().cpu().numpy()  # [3,H/2,W/2]
-    v_out = v_out.squeeze(0).squeeze(1).detach().cpu().numpy()  # [3,H/2,W/2]
+    y_out = y_out.squeeze(0).squeeze(1).detach().cpu().numpy()
+    u_out = u_out.squeeze(0).squeeze(1).detach().cpu().numpy()
+    v_out = v_out.squeeze(0).squeeze(1).detach().cpu().numpy()
 
     return y_out, u_out, v_out
 
@@ -315,25 +383,22 @@ def process_one_sequence_nonoverlap(
     yuv_path: Path,
     width: int,
     height: int,
-    total_frames_in_file: int,
     used_frames: int,
     bit_depth: int,
     out_yuv_path: Path,
     device: torch.device,
 ):
     """
-    Non-overlap 3-frame inference.
+    Non-overlap 3-frame processing.
 
     Example:
-      T=10
-      chunks:
-        0~2
-        3~5
-        6~8
-        9~11 -> reflect padded
+      start=0 -> frames [0,1,2]
+      start=3 -> frames [3,4,5]
+      ...
+      last chunk 부족하면 reflect padding
 
-    Output length is always used_frames.
-    Last chunk may be partially used.
+    Output length = used_frames
+    Output file format = always yuv420p10le
     """
     Y_raw, U_raw, V_raw = read_yuv420p_raw(
         path=yuv_path,
@@ -413,9 +478,6 @@ def build_encoder_cmd(
     frame_rate: int,
     input_bit_depth: int = 10,
 ) -> str:
-    """
-    Adjust this if your EncoderApp CLI differs.
-    """
     cmd = (
         f"{shlex.quote(str(encoder_app))} "
         f"-c {shlex.quote(str(cfg_path))} "
@@ -469,8 +531,6 @@ def build_codec_paths(
     qp: int,
 ) -> Tuple[Path, Path, Path]:
     """
-    Organized for later deblur stage.
-
     codec_root/
       qp22/
         bin/<seq_cls>/<seq_name>.bin
@@ -497,7 +557,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # metadata
-    parser.add_argument("--json_path", type=str, required=True, help="JSON containing sequence metadata")
+    parser.add_argument("--yaml", type=str, required=True, help="dataset yaml (seq dict)")
 
     # blur inference
     parser.add_argument("--blur_out_root", type=str, required=True, help="Root folder to save blurred full-res yuvs")
@@ -509,11 +569,11 @@ def main():
         "--frame_limit",
         type=int,
         default=0,
-        help="0: use all frames from JSON. >0: use first N frames for every sequence."
+        help="0: use all frames from yaml. >0: use first N frames for every sequence."
     )
 
-    # sequence filter
-    parser.add_argument("--only_seq", type=str, default="", help="Comma-separated sequence names to process")
+    # filters
+    parser.add_argument("--only_seq", type=str, default="", help="comma-separated seq names")
 
     # encoder submit
     parser.add_argument("--submit_bsub", action="store_true")
@@ -537,13 +597,11 @@ def main():
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     qps = parse_qp_list(args.qps)
 
-    seq_items = load_json_meta(Path(args.json_path))
     only_seq = {s.strip() for s in args.only_seq.split(",") if s.strip()}
-    if only_seq:
-        seq_items = [x for x in seq_items if x["name"] in only_seq]
-
-    if not seq_items:
-        raise RuntimeError("No sequences to process after filtering")
+    seq_items = collect_seq_items_from_yaml(
+        Path(args.yaml),
+        only_seq=only_seq if only_seq else None,
+    )
 
     blur_root = Path(args.blur_out_root) / args.tag
     blur_yuv_root = blur_root / "blur_yuv"
@@ -595,8 +653,6 @@ def main():
             print(f"[SKIP] missing yuv: {yuv_path}")
             continue
 
-        # blur output path
-        # blur_yuv/<seq_cls>/<seq_name>.yuv
         out_yuv_path = blur_yuv_root / seq_cls / f"{seq_name}.yuv"
 
         print(
@@ -610,7 +666,6 @@ def main():
             yuv_path=yuv_path,
             width=width,
             height=height,
-            total_frames_in_file=total_frames,
             used_frames=used_frames,
             bit_depth=bit_depth,
             out_yuv_path=out_yuv_path,
@@ -639,7 +694,7 @@ def main():
                     qp=qp,
                     intra_period=args.intra_period,
                     frame_rate=int(round(fps)),
-                    input_bit_depth=10,   # blurred output is always 10-bit
+                    input_bit_depth=10,  # blurred output is always 10-bit
                 )
                 pending_cmds.append(cmd)
 
