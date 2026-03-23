@@ -729,3 +729,147 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@torch.no_grad()
+def run_model_on_triplet(
+    model: torch.nn.Module,
+    Y3: np.ndarray,
+    U3: np.ndarray,
+    V3: np.ndarray,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Inputs:
+      Y3: [3,H,W]
+      U3: [3,H/2,W/2]
+      V3: [3,H/2,W/2]
+
+    Model I/O:
+      in : [B,3,1,H,W], [B,3,1,H/2,W/2], [B,3,1,H/2,W/2]
+      out: same temporal length 3
+
+    Returns:
+      Y_out: [3,H,W]
+      U_out: [3,H/2,W/2]
+      V_out: [3,H/2,W/2]
+    """
+    y = torch.from_numpy(Y3).to(device).unsqueeze(0).unsqueeze(2)  # [1,3,1,H,W]
+    u = torch.from_numpy(U3).to(device).unsqueeze(0).unsqueeze(2)  # [1,3,1,H/2,W/2]
+    v = torch.from_numpy(V3).to(device).unsqueeze(0).unsqueeze(2)  # [1,3,1,H/2,W/2]
+
+    y, (py, px) = pad_btchw_to_multiple_of_16(y)
+    u, (puy, pux) = pad_btchw_to_multiple_of_16(u)
+    v, (pvy, pvx) = pad_btchw_to_multiple_of_16(v)
+
+    y_out, u_out, v_out = model(y, u, v)
+
+    y_out = crop_btchw(y_out, py, px)
+    u_out = crop_btchw(u_out, puy, pux)
+    v_out = crop_btchw(v_out, pvy, pvx)
+
+    # expected: [1,3,1,H,W] -> [3,H,W]
+    if y_out.ndim != 5 or u_out.ndim != 5 or v_out.ndim != 5:
+        raise RuntimeError(
+            f"Expected 5D outputs, got "
+            f"Y:{tuple(y_out.shape)} U:{tuple(u_out.shape)} V:{tuple(v_out.shape)}"
+        )
+
+    y_out = y_out.squeeze(0).squeeze(1).clamp(0, 1).detach().cpu().numpy()  # [3,H,W]
+    u_out = u_out.squeeze(0).squeeze(1).clamp(0, 1).detach().cpu().numpy()  # [3,H/2,W/2]
+    v_out = v_out.squeeze(0).squeeze(1).clamp(0, 1).detach().cpu().numpy()  # [3,H/2,W/2]
+
+    return y_out, u_out, v_out
+
+
+@torch.no_grad()
+def process_one_sequence_nonoverlap(
+    model: torch.nn.Module,
+    yuv_path: Path,
+    width: int,
+    height: int,
+    used_frames: int,
+    bit_depth: int,
+    out_yuv_path: Path,
+    device: torch.device,
+):
+    """
+    Non-overlap 3-frame processing.
+
+    Example:
+      start=0 -> frames [0,1,2]
+      start=3 -> frames [3,4,5]
+      ...
+      last chunk 부족하면 reflect padding
+
+    Output length = used_frames
+    Output file format = always yuv420p10le
+    """
+    Y_raw, U_raw, V_raw = read_yuv420p_raw(
+        path=yuv_path,
+        width=width,
+        height=height,
+        num_frames=used_frames,
+        bit_depth=bit_depth,
+    )
+
+    Y = to_float01(Y_raw, bit_depth)
+    U = to_float01(U_raw, bit_depth)
+    V = to_float01(V_raw, bit_depth)
+
+    T = used_frames
+    H, W = Y.shape[1], Y.shape[2]
+    H2, W2 = U.shape[1], U.shape[2]
+
+    outY = np.empty((T, H, W), dtype=np.float32)
+    outU = np.empty((T, H2, W2), dtype=np.float32)
+    outV = np.empty((T, H2, W2), dtype=np.float32)
+
+    for start in range(0, T, 3):
+        idxs = get_triplet_indices_no_overlap(start, T)
+
+        Y3 = Y[idxs]  # [3,H,W]
+        U3 = U[idxs]  # [3,H/2,W/2]
+        V3 = V[idxs]  # [3,H/2,W/2]
+
+        Yo, Uo, Vo = run_model_on_triplet(
+            model=model,
+            Y3=Y3,
+            U3=U3,
+            V3=V3,
+            device=device,
+        )
+
+        valid_len = min(3, T - start)
+        outY[start:start + valid_len] = Yo[:valid_len]
+        outU[start:start + valid_len] = Uo[:valid_len]
+        outV[start:start + valid_len] = Vo[:valid_len]
+
+    save_yuv420p10le(
+        out_yuv_path,
+        float01_to_uint10(outY),
+        float01_to_uint10(outU),
+        float01_to_uint10(outV),
+    )
